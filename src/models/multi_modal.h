@@ -30,6 +30,13 @@ struct MultiModalLanguageModel : Model {
   std::unique_ptr<OrtSessionOptions> vision_session_options_;
   std::unique_ptr<OrtSessionOptions> speech_session_options_;
   std::unique_ptr<OrtSessionOptions> embedding_session_options_;
+
+  // True for OpenVINO-style VLM exports (e.g. gemma3 optimum-intel) whose embedding
+  // model is text-only (no image_features input). In that layout the vision/text
+  // fusion is performed externally by scattering vision features into inputs_embeds
+  // at image-token positions, rather than feeding image_features into the embedding
+  // graph. Stays false for standard fused-embedding models, leaving them unchanged.
+  bool external_image_injection_{false};
 };
 
 // Base VisionState: runs vision.onnx with a single State::Run() call.
@@ -137,6 +144,7 @@ struct DecoderState : State {
 
   DeviceSpan<float> Run(int current_length, DeviceSpan<int32_t>& next_tokens, DeviceSpan<int32_t> next_indices) override;
   void UpdateInputsOutputs(DeviceSpan<int32_t>& next_tokens, int current_length, DeviceSpan<int32_t> beam_indices);
+  void RewindTo(size_t index) override;
 
  private:
   friend struct MultiModalPipelineState;
@@ -169,9 +177,21 @@ struct MultiModalPipelineState : State {
 
   OrtValue* GetOutput(const char* name) override;
 
+  void RewindTo(size_t index) override;
+
  private:
   void UpdateInputsOutputs(const DeviceSpan<int32_t>& next_tokens, DeviceSpan<int32_t> next_indices,
                            int current_length);
+
+  // OpenVINO-style external vision/text fusion: scatter vision encoder features into
+  // the image-token positions (token_type_ids == 1) of the decoder's inputs_embeds.
+  void InjectImageFeatures();
+
+  // OpenVINO-style decoders (e.g. gemma3 optimum-intel) declare a token_type_ids graph
+  // input (int64 [batch, seq]) that genai's config does not map. Build and bind it to the
+  // decoder before each Run: image positions come from the processor's token_type_ids on
+  // the prompt step; generated tokens are always text (0).
+  void BindDecoderTokenTypeIds(bool is_prompt);
 
   const MultiModalLanguageModel& model_;
   int64_t num_image_tokens_{};
@@ -183,6 +203,17 @@ struct MultiModalPipelineState : State {
   std::unique_ptr<DecoderState> decoder_state_;
   std::shared_ptr<Adapters> adapters_;
   bool is_prompt_{true};
+
+  // token_type_ids from the multimodal processor (image positions == 1), used only on
+  // the external-injection path to locate where vision features go in inputs_embeds.
+  std::shared_ptr<Tensor> token_type_ids_;
+
+  // Owned int64 token_type_ids tensor bound into the decoder's input list on the
+  // external-injection path (see BindDecoderTokenTypeIds). Recreated each Run.
+  std::unique_ptr<OrtValue> decoder_token_type_ids_value_;
+  std::string decoder_token_type_ids_name_;
+  int decoder_token_type_ids_idx_{-1};
+  bool decoder_token_type_ids_checked_{false};
 
   const std::string vision_adapter_name_{"vision"};
   const std::string speech_adapter_name_{"speech"};

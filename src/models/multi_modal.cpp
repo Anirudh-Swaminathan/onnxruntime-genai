@@ -120,6 +120,18 @@ MultiModalLanguageModel::MultiModalLanguageModel(std::unique_ptr<Config> config,
   if (vision) {
     session_info_.Add(*vision_session_);
   }
+
+  // OpenVINO-style VLM exports (e.g. gemma3 optimum-intel) use a text-only embedding
+  // model: the vision/text fusion is done externally by scattering vision features
+  // into inputs_embeds at image-token positions, instead of feeding image_features
+  // into the embedding graph. Detect that layout here (embedding ONNX lacks the
+  // image_features input) so the pipeline can branch. Standard fused-embedding
+  // models keep external_image_injection_ == false and are unaffected.
+  if (vision) {
+    SessionInfo embedding_only_info;
+    embedding_only_info.Add(*embedding_session_);
+    external_image_injection_ = !embedding_only_info.HasInput(config_->model.embedding.inputs.image_features);
+  }
 }
 
 std::unique_ptr<State> MultiModalLanguageModel::CreateState(DeviceSpan<int32_t> sequence_lengths, const GeneratorParams& params) const {
@@ -616,7 +628,9 @@ void EmbeddingState::SetExtraInputs(const int64_t num_images, const int64_t num_
   num_image_tokens_ = num_image_tokens;
   num_audio_tokens_ = num_audio_tokens;
 
-  if (model_.vision_session_) {
+  // Skip the image_features input for OpenVINO-style exports whose embedding model is
+  // text-only; those receive vision features via external injection into inputs_embeds.
+  if (model_.vision_session_ && !model_.external_image_injection_) {
     image_features_ = std::make_unique<MultiModalFeatures>(*this, MultiModalFeatures::Mode::Input,  // Optional model input
                                                            model_.config_->model.embedding.inputs.image_features,
                                                            num_images, num_image_tokens_);
@@ -640,7 +654,7 @@ void EmbeddingState::SetExtraInputs(const int64_t num_images, const int64_t num_
 
 void EmbeddingState::UpdateInputsOutputs(DeviceSpan<int32_t>& next_tokens, bool is_prompt) {
   input_ids_.Update(next_tokens);
-  if (model_.vision_session_) image_features_->Update(is_prompt);
+  if (image_features_) image_features_->Update(is_prompt);
   if (audio_features_) audio_features_->Update(is_prompt);
 }
 
@@ -726,6 +740,14 @@ void DecoderState::UpdateInputsOutputs(DeviceSpan<int32_t>& next_tokens, int tot
   if (per_layer_inputs_) per_layer_inputs_->UpdateSequenceLength(new_length);
 }
 
+void DecoderState::RewindTo(size_t index) {
+  if (position_inputs_) position_inputs_->RewindTo(index);
+  if (kv_cache_)
+    kv_cache_->RewindTo(index);
+  if (recurrent_state_)
+    recurrent_state_->RewindTo(index);
+}
+
 MultiModalPipelineState::MultiModalPipelineState(const MultiModalLanguageModel& model, DeviceSpan<int32_t> sequence_lengths, const GeneratorParams& params)
     : State{params, model},
       model_{model},
@@ -755,6 +777,19 @@ void MultiModalPipelineState::SetExtraInputs(const std::vector<ExtraInput>& extr
   num_audio_tokens_ = GetNumAudioTokens(extra_inputs, model_.config_->model.speech.inputs.audio_sizes);
   num_images_ = GetImageFeatureBatchSize(extra_inputs);
 
+  // OpenVINO-style external injection needs token_type_ids to know which sequence
+  // positions are image tokens (value == 1). Capture it here; it is absent for
+  // text-only turns, in which case no injection happens.
+  if (model_.external_image_injection_) {
+    token_type_ids_.reset();
+    for (const auto& input : extra_inputs) {
+      if (input.name == Config::Defaults::TokenTypeIdsName) {
+        token_type_ids_ = input.tensor;
+        break;
+      }
+    }
+  }
+
   if (model_.vision_session_) {
     vision_state_->SetExtraInputs(extra_inputs, num_images_, num_image_tokens_);
   }
@@ -782,6 +817,129 @@ void MultiModalPipelineState::SetExtraInputs(const std::vector<ExtraInput>& extr
   }
 }
 
+void MultiModalPipelineState::InjectImageFeatures() {
+  // OpenVINO-style VLM exports have a text-only embedding model, so the image rows of
+  // inputs_embeds are not filled by the embedding graph. Scatter the vision encoder's
+  // output (last_hidden_state) into the image-token positions of inputs_embeds here,
+  // mirroring what optimum/OpenVINO GenAI does inside its own runtime.
+  //
+  // Layout assumptions (validated at runtime below):
+  //   inputs_embeds : [..., seq_len, hidden]  (batch assumed 1 for this path)
+  //   image_features: [..., feat_rows, hidden]
+  //   token_type_ids: [seq_len] int32, value == 1 at image positions.
+  // Image-token positions are filled in order from successive vision feature rows,
+  // which naturally supports multiple images (their features are concatenated).
+  OrtValue* embeds = decoder_state_->inputs_embeds_.Get();
+  OrtValue* feats = vision_state_->image_features_->Get();
+  if (!embeds || !feats) return;
+
+  auto embeds_info = embeds->GetTensorTypeAndShapeInfo();
+  auto feats_info = feats->GetTensorTypeAndShapeInfo();
+  const auto embeds_shape = embeds_info->GetShape();
+  const auto feats_shape = feats_info->GetShape();
+  const auto embeds_type = embeds_info->GetElementType();
+  const auto feats_type = feats_info->GetElementType();
+
+  if (embeds_shape.empty() || feats_shape.empty())
+    throw std::runtime_error("External image injection: unexpected scalar tensor for inputs_embeds or image_features.");
+  if (embeds_type != feats_type)
+    throw std::runtime_error("External image injection: inputs_embeds and image_features element types differ.");
+
+  const int64_t hidden = embeds_shape.back();
+  if (feats_shape.back() != hidden)
+    throw std::runtime_error("External image injection: hidden size mismatch between vision features and inputs_embeds.");
+
+  // Rows = product of all dims except the last (hidden).
+  int64_t seq_len = 1;
+  for (size_t i = 0; i + 1 < embeds_shape.size(); ++i) seq_len *= embeds_shape[i];
+  int64_t feat_rows = 1;
+  for (size_t i = 0; i + 1 < feats_shape.size(); ++i) feat_rows *= feats_shape[i];
+
+  auto element_size = [](ONNXTensorElementDataType t) -> size_t {
+    switch (t) {
+      case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT:
+        return 4;
+      case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16:
+      case ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16:
+        return 2;
+      case ONNX_TENSOR_ELEMENT_DATA_TYPE_DOUBLE:
+        return 8;
+      default:
+        throw std::runtime_error("External image injection: unsupported inputs_embeds element type.");
+    }
+  };
+  const size_t row_bytes = static_cast<size_t>(hidden) * element_size(embeds_type);
+
+  if (!token_type_ids_ || !token_type_ids_->ort_tensor_)
+    throw std::runtime_error("External image injection requires token_type_ids to locate image positions.");
+  const int32_t* tti = token_type_ids_->ort_tensor_->GetTensorData<int32_t>();
+  const int64_t tti_count = token_type_ids_->ort_tensor_->GetTensorTypeAndShapeInfo()->GetElementCount();
+
+  uint8_t* embeds_raw = static_cast<uint8_t*>(embeds->GetTensorMutableRawData());
+  const uint8_t* feats_raw = static_cast<const uint8_t*>(feats->GetTensorMutableRawData());
+
+  const int64_t n = seq_len < tti_count ? seq_len : tti_count;
+  int64_t feat_idx = 0;
+  for (int64_t p = 0; p < n; ++p) {
+    if (tti[p] == 1) {
+      if (feat_idx >= feat_rows)
+        throw std::runtime_error("External image injection: more image tokens in token_type_ids than vision feature rows.");
+      std::memcpy(embeds_raw + static_cast<size_t>(p) * row_bytes,
+                  feats_raw + static_cast<size_t>(feat_idx) * row_bytes,
+                  row_bytes);
+      ++feat_idx;
+    }
+  }
+}
+
+void MultiModalPipelineState::BindDecoderTokenTypeIds(bool is_prompt) {
+  // The OpenVINO gemma3 decoder graph requires a token_type_ids input (int64, [batch, seq])
+  // that genai's config does not map, so genai never binds it and the OpenVINO EP fails with
+  // "the ort_value must contain a constructed tensor". Build and bind it here, gated on the
+  // external-injection path. On the prompt step the values come from the processor's
+  // token_type_ids (image tokens == 1); generated tokens are always text (0).
+  const std::string token_type_ids_name{Config::Defaults::TokenTypeIdsName};
+
+  // Lazily register the input into the decoder's input list the first time, only if the
+  // decoder graph actually declares it (keeps non-OV / non-gemma3 decoders unaffected).
+  if (!decoder_token_type_ids_checked_) {
+    decoder_token_type_ids_checked_ = true;
+    SessionInfo decoder_only_info;
+    decoder_only_info.Add(*model_.decoder_session_);
+    if (decoder_only_info.HasInput(token_type_ids_name)) {
+      decoder_token_type_ids_name_ = token_type_ids_name;
+      decoder_token_type_ids_idx_ = static_cast<int>(decoder_state_->input_names_.size());
+      decoder_state_->input_names_.push_back(decoder_token_type_ids_name_.c_str());
+      decoder_state_->inputs_.push_back(nullptr);  // populated below
+    }
+  }
+
+  if (decoder_token_type_ids_idx_ < 0)
+    return;  // decoder doesn't take token_type_ids
+
+  const auto& embeds_shape = decoder_state_->inputs_embeds_.GetShape();  // [batch, seq, hidden]
+  const int64_t batch = embeds_shape.size() > 0 ? embeds_shape[0] : 1;
+  const int64_t seq = embeds_shape.size() > 1 ? embeds_shape[1] : 1;
+  const int64_t total = batch * seq;
+
+  std::vector<int64_t> shape{batch, seq};
+  decoder_token_type_ids_value_ = OrtValue::CreateTensor<int64_t>(model_.allocator_cpu_, shape);
+  int64_t* dst = decoder_token_type_ids_value_->GetTensorMutableData<int64_t>();
+
+  if (is_prompt && token_type_ids_ && token_type_ids_->ort_tensor_) {
+    // Processor token_type_ids is int32; the decoder wants int64. Copy with conversion.
+    const int32_t* src = token_type_ids_->ort_tensor_->GetTensorData<int32_t>();
+    const int64_t n = token_type_ids_->ort_tensor_->GetTensorTypeAndShapeInfo()->GetElementCount();
+    for (int64_t i = 0; i < total; ++i)
+      dst[i] = (i < n) ? static_cast<int64_t>(src[i]) : 0;
+  } else {
+    for (int64_t i = 0; i < total; ++i)
+      dst[i] = 0;
+  }
+
+  decoder_state_->inputs_[decoder_token_type_ids_idx_] = decoder_token_type_ids_value_.get();
+}
+
 DeviceSpan<float> MultiModalPipelineState::Run(int current_length, DeviceSpan<int32_t>& next_tokens, DeviceSpan<int32_t> next_indices) {
   // Pipeline state defines the pipeline of the execution of the models
   // Prompt stage:
@@ -803,7 +961,7 @@ DeviceSpan<float> MultiModalPipelineState::Run(int current_length, DeviceSpan<in
     if (num_audio_tokens_ > 0 && speech_state_) {
       speech_state_->Run(current_length, next_tokens, next_indices);
     }
-    if (vision_state_) {
+    if (vision_state_ && embedding_state_->image_features_) {
       embedding_state_->image_features_->ReuseFeaturesBuffer(*vision_state_->image_features_);
     }
     if (speech_state_ && num_audio_tokens_ > 0) {
@@ -825,6 +983,17 @@ DeviceSpan<float> MultiModalPipelineState::Run(int current_length, DeviceSpan<in
     }
     embedding_state_->Run(current_length, next_tokens, next_indices);
 
+    // OpenVINO-style VLM: the text-only embedding model produced inputs_embeds for the
+    // text tokens only. Scatter the vision encoder's features into the image-token
+    // positions of inputs_embeds before the decoder consumes them.
+    if (model_.external_image_injection_ && vision_state_ && num_image_tokens_ > 0) {
+      InjectImageFeatures();
+    }
+
+    if (model_.external_image_injection_) {
+      BindDecoderTokenTypeIds(/*is_prompt=*/true);
+    }
+
     auto logits = decoder_state_->Run(current_length, next_tokens, next_indices);
 
     is_prompt_ = false;
@@ -839,7 +1008,21 @@ DeviceSpan<float> MultiModalPipelineState::Run(int current_length, DeviceSpan<in
     embedding_state_->per_layer_inputs_->ReuseEmbeddingsBuffer(*decoder_state_->per_layer_inputs_);
   }
   embedding_state_->Run(current_length, next_tokens, next_indices);
+  if (model_.external_image_injection_) {
+    BindDecoderTokenTypeIds(/*is_prompt=*/false);
+  }
   return decoder_state_->Run(current_length, next_tokens, next_indices);
+}
+
+void MultiModalPipelineState::RewindTo(size_t index) {
+  // Forward the rewind to the decoder so the KV cache is reset. For OpenVINO/QNN
+  // stateful decoders this issues the 'kvcache_rewind' EP dynamic option, trimming
+  // the session-internal KV cache before the next Run. Without this, rewind_to(0)
+  // would reset genai's own counters/masks while leaving stale entries in the
+  // stateful cache, causing a shape mismatch on the next prompt.
+  if (decoder_state_) decoder_state_->RewindTo(index);
+  // A full rewind means the next turn replays the prompt path (vision/embedding fusion).
+  if (index == 0) is_prompt_ = true;
 }
 
 OrtValue* MultiModalPipelineState::GetInput(const char* name) {
