@@ -817,7 +817,7 @@ void MultiModalPipelineState::SetExtraInputs(const std::vector<ExtraInput>& extr
   }
 }
 
-void MultiModalPipelineState::InjectImageFeatures() {
+void MultiModalPipelineState::InjectImageFeatures(DeviceSpan<int32_t> next_tokens) {
   // OpenVINO-style VLM exports have a text-only embedding model, so the image rows of
   // inputs_embeds are not filled by the embedding graph. Scatter the vision encoder's
   // output (last_hidden_state) into the image-token positions of inputs_embeds here,
@@ -870,25 +870,45 @@ void MultiModalPipelineState::InjectImageFeatures() {
   };
   const size_t row_bytes = static_cast<size_t>(hidden) * element_size(embeds_type);
 
-  if (!token_type_ids_ || !token_type_ids_->ort_tensor_)
-    throw std::runtime_error("External image injection requires token_type_ids to locate image positions.");
-  const int32_t* tti = token_type_ids_->ort_tensor_->GetTensorData<int32_t>();
-  const int64_t tti_count = token_type_ids_->ort_tensor_->GetTensorTypeAndShapeInfo()->GetElementCount();
-
   uint8_t* embeds_raw = static_cast<uint8_t*>(embeds->GetTensorMutableRawData());
   const uint8_t* feats_raw = static_cast<const uint8_t*>(feats->GetTensorMutableRawData());
-
-  const int64_t n = seq_len < tti_count ? seq_len : tti_count;
   int64_t feat_idx = 0;
-  for (int64_t p = 0; p < n; ++p) {
-    if (tti[p] == 1) {
-      if (feat_idx >= feat_rows)
-        throw std::runtime_error("External image injection: more image tokens in token_type_ids than vision feature rows.");
-      std::memcpy(embeds_raw + static_cast<size_t>(p) * row_bytes,
-                  feats_raw + static_cast<size_t>(feat_idx) * row_bytes,
-                  row_bytes);
-      ++feat_idx;
+
+  if (token_type_ids_ && token_type_ids_->ort_tensor_) {
+    // Path A (gemma3 / processor-emitted token_type_ids): value == 1 marks image positions.
+    const int32_t* tti = token_type_ids_->ort_tensor_->GetTensorData<int32_t>();
+    const int64_t tti_count = token_type_ids_->ort_tensor_->GetTensorTypeAndShapeInfo()->GetElementCount();
+    const int64_t n = seq_len < tti_count ? seq_len : tti_count;
+    for (int64_t p = 0; p < n; ++p) {
+      if (tti[p] == 1) {
+        if (feat_idx >= feat_rows)
+          throw std::runtime_error("External image injection: more image tokens in token_type_ids than vision feature rows.");
+        std::memcpy(embeds_raw + static_cast<size_t>(p) * row_bytes,
+                    feats_raw + static_cast<size_t>(feat_idx) * row_bytes,
+                    row_bytes);
+        ++feat_idx;
+      }
     }
+  } else if (model_.config_->model.image_token_id != 0) {
+    // Path B (Qwen-style / no token_type_ids): image positions identified by matching
+    // image_token_id set in genai_config.json under "model".
+    const int32_t img_tok = static_cast<int32_t>(model_.config_->model.image_token_id);
+    const auto toks = next_tokens.CopyDeviceToCpu();
+    for (int64_t p = 0; p < seq_len; ++p) {
+      if (toks[static_cast<size_t>(p)] == img_tok) {
+        if (feat_idx >= feat_rows)
+          throw std::runtime_error("External image injection: more image tokens in next_tokens than vision feature rows.");
+        std::memcpy(embeds_raw + static_cast<size_t>(p) * row_bytes,
+                    feats_raw + static_cast<size_t>(feat_idx) * row_bytes,
+                    row_bytes);
+        ++feat_idx;
+      }
+    }
+  } else {
+    throw std::runtime_error(
+        "External image injection: token_type_ids not provided by the processor and "
+        "image_token_id is not set in genai_config.json. Add \"image_token_id\": <value> "
+        "under \"model\" in genai_config.json, or ensure the processor provides token_type_ids.");
   }
 }
 
@@ -987,7 +1007,7 @@ DeviceSpan<float> MultiModalPipelineState::Run(int current_length, DeviceSpan<in
     // text tokens only. Scatter the vision encoder's features into the image-token
     // positions of inputs_embeds before the decoder consumes them.
     if (model_.external_image_injection_ && vision_state_ && num_image_tokens_ > 0) {
-      InjectImageFeatures();
+      InjectImageFeatures(next_tokens);
     }
 
     if (model_.external_image_injection_) {

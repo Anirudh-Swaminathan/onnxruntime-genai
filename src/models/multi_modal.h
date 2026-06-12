@@ -184,8 +184,10 @@ struct MultiModalPipelineState : State {
                            int current_length);
 
   // OpenVINO-style external vision/text fusion: scatter vision encoder features into
-  // the image-token positions (token_type_ids == 1) of the decoder's inputs_embeds.
-  void InjectImageFeatures();
+  // the image-token positions of the decoder's inputs_embeds.
+  // Path A: uses token_type_ids (processor-emitted, e.g. gemma3).
+  // Path B: uses image_token_id from genai_config.json (e.g. Qwen-style, no token_type_ids).
+  void InjectImageFeatures(DeviceSpan<int32_t> next_tokens);
 
   // OpenVINO-style decoders (e.g. gemma3 optimum-intel) declare a token_type_ids graph
   // input (int64 [batch, seq]) that genai's config does not map. Build and bind it to the
