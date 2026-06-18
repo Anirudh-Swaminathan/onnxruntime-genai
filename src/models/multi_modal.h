@@ -189,6 +189,22 @@ struct MultiModalPipelineState : State {
   // Path B: uses image_token_id from genai_config.json (e.g. Qwen-style, no token_type_ids).
   void InjectImageFeatures(DeviceSpan<int32_t> next_tokens);
 
+  // Single-row memcpy: copies feat_row_idx from vision_state_->image_features_ into
+  // position 0 of decoder_state_->inputs_embeds_ (single-token injection in per-token loop).
+  void InjectImageFeatureRow(int64_t feat_row_idx);
+
+  // Returns true if the token at batch_idx in the current continuation is an image token.
+  // Path A: checks token_type_ids_[batch_idx] == 1; Path B: checks image_token_id.
+  bool IsImageTokenAt(int64_t batch_idx, DeviceSpan<int32_t> single_tok) const;
+
+  // Per-token continuation loop for when the NPU generate kernel cannot handle token
+  // batches larger than 1. has_images controls image injection per token.
+  // Caller must establish ReuseEmbeddingsBuffer before calling.
+  DeviceSpan<float> RunContinuationSingleToken(int current_length,
+                                               DeviceSpan<int32_t>& next_tokens,
+                                               DeviceSpan<int32_t> next_indices,
+                                               bool has_images);
+
   // OpenVINO-style decoders (e.g. gemma3 optimum-intel) declare a token_type_ids graph
   // input (int64 [batch, seq]) that genai's config does not map. Build and bind it to the
   // decoder before each Run: image positions come from the processor's token_type_ids on
@@ -205,6 +221,14 @@ struct MultiModalPipelineState : State {
   std::unique_ptr<DecoderState> decoder_state_;
   std::shared_ptr<Adapters> adapters_;
   bool is_prompt_{true};
+  // True when set_inputs() is called mid-session (non-UCH) with new images. Allows the
+  // vision encoder and image injection to run even though is_prompt_ is already false
+  // (KV cache should not be reset, but image features must be processed for the new tokens).
+  bool is_image_continuation_{false};
+  // Set permanently on the first non-UCH multi-token batch decoder failure (e.g. NPU
+  // generate kernel compiled for exactly 1 token). Once true, all continuation turns
+  // use RunContinuationSingleToken regardless of image presence.
+  bool force_single_token_continuation_{false};
 
   // token_type_ids from the multimodal processor (image positions == 1), used only on
   // the external-injection path to locate where vision features go in inputs_embeds.

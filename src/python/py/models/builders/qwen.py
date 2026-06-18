@@ -10,12 +10,11 @@ import os
 import numpy as np
 import onnx_ir as ir
 import torch
-from transformers import (
-    AutoConfig,
-    Qwen2ForCausalLM,
-    Qwen2_5_VLForConditionalGeneration,
-    Qwen3VLForConditionalGeneration,
-)
+from transformers import AutoConfig, Qwen2ForCausalLM, Qwen2_5_VLForConditionalGeneration
+try:
+    from transformers import Qwen3VLForConditionalGeneration
+except ImportError:
+    Qwen3VLForConditionalGeneration = None
 
 from .base import Model
 

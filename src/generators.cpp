@@ -616,6 +616,11 @@ void Generator::SetInputs(const NamedTensors& named_tensors) {
     throw std::runtime_error("Please use generator.AppendTokens for " + model_->config_->model.type + ". SetInputs is not supported for this model type.");
   }
 
+  // Reset on every call so that SetExtraInputs fires for each turn (e.g. multi-turn VLM
+  // where new images arrive in later turns without a full rewind_to(0)).
+  set_extra_inputs_ = true;
+  extra_inputs_.clear();
+
   cpu_span<int32_t> input_ids;
   for (const auto& [name, tensor] : named_tensors) {
     if (name == Config::Defaults::InputIdsName) {

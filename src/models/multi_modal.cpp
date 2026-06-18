@@ -777,6 +777,10 @@ void MultiModalPipelineState::SetExtraInputs(const std::vector<ExtraInput>& extr
   num_audio_tokens_ = GetNumAudioTokens(extra_inputs, model_.config_->model.speech.inputs.audio_sizes);
   num_images_ = GetImageFeatureBatchSize(extra_inputs);
 
+  // Non-UCH multi-turn: new images supplied mid-session (is_prompt_ already false).  // Mark the continuation so Run() takes the full vision+embedding+inject path even
+  // though the KV cache is not being rewound.
+  is_image_continuation_ = (!is_prompt_ && num_images_ > 0);
+
   // OpenVINO-style external injection needs token_type_ids to know which sequence
   // positions are image tokens (value == 1). Capture it here; it is absent for
   // text-only turns, in which case no injection happens.
@@ -791,6 +795,9 @@ void MultiModalPipelineState::SetExtraInputs(const std::vector<ExtraInput>& extr
   }
 
   if (model_.vision_session_) {
+    // Lazily recreate vision_state_ if it was released after the first prompt (e.g. UCH
+    // turn 2+ after rewind_to(0), or non-UCH turn 2+ with new images).
+    if (!vision_state_) vision_state_ = CreateVisionState(model_, *params_);
     vision_state_->SetExtraInputs(extra_inputs, num_images_, num_image_tokens_);
   }
   if (model_.speech_session_) {
@@ -912,6 +919,88 @@ void MultiModalPipelineState::InjectImageFeatures(DeviceSpan<int32_t> next_token
   }
 }
 
+bool MultiModalPipelineState::IsImageTokenAt(int64_t batch_idx, DeviceSpan<int32_t> single_tok) const {
+  // Path A (gemma3): processor-provided token_type_ids marks image positions (value == 1).
+  if (token_type_ids_ && token_type_ids_->ort_tensor_) {
+    const int32_t* tti = token_type_ids_->ort_tensor_->GetTensorData<int32_t>();
+    const int64_t tti_count = token_type_ids_->ort_tensor_->GetTensorTypeAndShapeInfo()->GetElementCount();
+    return batch_idx < tti_count && tti[batch_idx] == 1;
+  }
+  // Path B (Qwen-style): image positions identified by image_token_id in genai_config.json.
+  if (model_.config_->model.image_token_id != 0) {
+    const auto toks = single_tok.CopyDeviceToCpu();
+    return !toks.empty() && toks[0] == static_cast<int32_t>(model_.config_->model.image_token_id);
+  }
+  return false;
+}
+
+void MultiModalPipelineState::InjectImageFeatureRow(int64_t feat_row_idx) {
+  // Copies one vision feature row into position 0 of decoder inputs_embeds (single-token mode).
+  OrtValue* embeds = decoder_state_->inputs_embeds_.Get();
+  OrtValue* feats = vision_state_->image_features_->Get();
+  if (!embeds || !feats) return;
+
+  const auto embeds_shape = embeds->GetTensorTypeAndShapeInfo()->GetShape();
+  const auto feats_shape = feats->GetTensorTypeAndShapeInfo()->GetShape();
+  const auto type = embeds->GetTensorTypeAndShapeInfo()->GetElementType();
+  if (embeds_shape.empty() || feats_shape.empty()) return;
+
+  const int64_t hidden = embeds_shape.back();
+  if (feats_shape.back() != hidden) return;
+
+  auto element_size = [](ONNXTensorElementDataType t) -> size_t {
+    switch (t) {
+      case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT: return 4;
+      case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16:
+      case ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16: return 2;
+      case ONNX_TENSOR_ELEMENT_DATA_TYPE_DOUBLE: return 8;
+      default: throw std::runtime_error("InjectImageFeatureRow: unsupported element type.");
+    }
+  };
+  const size_t row_bytes = static_cast<size_t>(hidden) * element_size(type);
+  uint8_t* dst = static_cast<uint8_t*>(embeds->GetTensorMutableRawData());  // position 0
+  const uint8_t* src = static_cast<const uint8_t*>(feats->GetTensorMutableRawData()) +
+                       static_cast<size_t>(feat_row_idx) * row_bytes;
+  std::memcpy(dst, src, row_bytes);
+}
+
+DeviceSpan<float> MultiModalPipelineState::RunContinuationSingleToken(
+    int current_length, DeviceSpan<int32_t>& next_tokens,
+    DeviceSpan<int32_t> next_indices, bool has_images) {
+  // Processes each token in next_tokens sequentially through the 1-token generate kernel.
+  // Caller must have established ReuseEmbeddingsBuffer before calling.
+  // If has_images, vision_state_ must still be alive with valid image features.
+  DeviceSpan<float> logits;
+  int64_t feat_idx = 0;
+  const int64_t n_tokens = static_cast<int64_t>(next_tokens.size());
+  for (int64_t i = 0; i < n_tokens; ++i) {
+    auto single_tok = next_tokens.subspan(static_cast<size_t>(i), 1);
+    embedding_state_->UpdateInputsOutputs(single_tok, /*is_prompt=*/has_images);
+    embedding_state_->Run(current_length + static_cast<int>(i), single_tok, next_indices);
+
+    const bool is_img = has_images && IsImageTokenAt(i, single_tok);
+    if (is_img) {
+      InjectImageFeatureRow(feat_idx++);
+    }
+
+    if (model_.external_image_injection_) {
+      // BindDecoderTokenTypeIds reads embeds_shape (seq=1 here) → creates [1,1] tensor.
+      // For a text token the all-zero fill from is_prompt=false is correct; for an image
+      // token we override position 0 to 1 after the call.
+      BindDecoderTokenTypeIds(/*is_prompt=*/false);
+      if (is_img && decoder_token_type_ids_idx_ >= 0 && decoder_token_type_ids_value_) {
+        decoder_token_type_ids_value_->GetTensorMutableData<int64_t>()[0] = 1;
+      }
+    }
+
+    decoder_state_->UpdateInputsOutputs(single_tok,
+                                        current_length + static_cast<int>(i),
+                                        next_indices);
+    logits = decoder_state_->Run(current_length + static_cast<int>(i), single_tok, next_indices);
+  }
+  return logits;
+}
+
 void MultiModalPipelineState::BindDecoderTokenTypeIds(bool is_prompt) {
   // The OpenVINO gemma3 decoder graph requires a token_type_ids input (int64, [batch, seq])
   // that genai's config does not map, so genai never binds it and the OpenVINO EP fails with
@@ -971,10 +1060,14 @@ DeviceSpan<float> MultiModalPipelineState::Run(int current_length, DeviceSpan<in
   //   - input_ids, image_features, audio_features -> |embeddings_model| -> inputs_embeds
   //   - inputs_embeds -> |decoder_model| -> logits
 
-  embedding_state_->UpdateInputsOutputs(next_tokens, is_prompt_);
-  decoder_state_->UpdateInputsOutputs(next_tokens, current_length, next_indices);
+  embedding_state_->UpdateInputsOutputs(next_tokens, is_prompt_ || is_image_continuation_);
+  // Skip N-token decoder setup when per-token mode is already determined; the single-token
+  // loop calls UpdateInputsOutputs per token with the correct position.
+  if (!(force_single_token_continuation_ && is_image_continuation_)) {
+    decoder_state_->UpdateInputsOutputs(next_tokens, current_length, next_indices);
+  }
 
-  if (is_prompt_) {
+  if (is_prompt_ || is_image_continuation_) {
     if (num_image_tokens_ > 0 && vision_state_) {
       vision_state_->Run(current_length, next_tokens, next_indices);
     }
@@ -1001,6 +1094,17 @@ DeviceSpan<float> MultiModalPipelineState::Run(int current_length, DeviceSpan<in
     if (embedding_state_->per_layer_inputs_ && decoder_state_->per_layer_inputs_) {
       embedding_state_->per_layer_inputs_->ReuseEmbeddingsBuffer(*decoder_state_->per_layer_inputs_);
     }
+
+    // Non-UCH image continuation: if we already know the NPU generate kernel cannot
+    // process a token batch, skip straight to single-token loop (vision features ready).
+    if (is_image_continuation_ && force_single_token_continuation_) {
+      auto logits = RunContinuationSingleToken(current_length, next_tokens, next_indices, /*has_images=*/true);
+      is_image_continuation_ = false;
+      if (vision_state_) vision_state_.reset();
+      if (speech_state_) speech_state_.reset();
+      return logits;
+    }
+
     embedding_state_->Run(current_length, next_tokens, next_indices);
 
     // OpenVINO-style VLM: the text-only embedding model produced inputs_embeds for the
@@ -1014,9 +1118,26 @@ DeviceSpan<float> MultiModalPipelineState::Run(int current_length, DeviceSpan<in
       BindDecoderTokenTypeIds(/*is_prompt=*/true);
     }
 
-    auto logits = decoder_state_->Run(current_length, next_tokens, next_indices);
+    // For non-UCH image continuation, wrap the batch decoder in a try-catch.
+    // If the NPU generate kernel cannot handle the batch size, fall back to single-token
+    // mode permanently and retry.
+    DeviceSpan<float> logits;
+    if (is_image_continuation_) {
+      try {
+        logits = decoder_state_->Run(current_length, next_tokens, next_indices);
+      } catch (const std::exception&) {
+        force_single_token_continuation_ = true;
+        // Undo any partial decoder state from the failed batch run.
+        decoder_state_->RewindTo(current_length);
+        // Vision features are still valid; reprocess all tokens one at a time.
+        logits = RunContinuationSingleToken(current_length, next_tokens, next_indices, /*has_images=*/true);
+      }
+    } else {
+      logits = decoder_state_->Run(current_length, next_tokens, next_indices);
+    }
 
-    is_prompt_ = false;
+    if (is_prompt_) is_prompt_ = false;  // preserve false when entering via is_image_continuation_
+    is_image_continuation_ = false;
     if (vision_state_) vision_state_.reset();  // The vision state is no longer needed in generation stage
     if (speech_state_) speech_state_.reset();  // The speech state is no longer needed in generation stage
 
@@ -1026,6 +1147,11 @@ DeviceSpan<float> MultiModalPipelineState::Run(int current_length, DeviceSpan<in
   embedding_state_->inputs_embeds_.ReuseEmbeddingsBuffer(decoder_state_->inputs_embeds_);
   if (embedding_state_->per_layer_inputs_ && decoder_state_->per_layer_inputs_) {
     embedding_state_->per_layer_inputs_->ReuseEmbeddingsBuffer(*decoder_state_->per_layer_inputs_);
+  }
+  // If the NPU generate kernel was found to support only 1 token at a time (from a prior
+  // image continuation failure), apply the same single-token loop to text-only continuation.
+  if (force_single_token_continuation_ && next_tokens.size() > 1) {
+    return RunContinuationSingleToken(current_length, next_tokens, next_indices, /*has_images=*/false);
   }
   embedding_state_->Run(current_length, next_tokens, next_indices);
   if (model_.external_image_injection_) {
@@ -1042,7 +1168,10 @@ void MultiModalPipelineState::RewindTo(size_t index) {
   // stateful cache, causing a shape mismatch on the next prompt.
   if (decoder_state_) decoder_state_->RewindTo(index);
   // A full rewind means the next turn replays the prompt path (vision/embedding fusion).
-  if (index == 0) is_prompt_ = true;
+  if (index == 0) {
+    is_prompt_ = true;
+    is_image_continuation_ = false;  // clear any stale non-UCH continuation flag
+  }
 }
 
 OrtValue* MultiModalPipelineState::GetInput(const char* name) {
