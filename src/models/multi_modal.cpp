@@ -858,7 +858,6 @@ void DecoderState::UpdateInputsOutputs(DeviceSpan<int32_t>& next_tokens, int tot
   logits_.Update(next_tokens, new_length);
   inputs_embeds_.UpdateSequenceLength(new_length);
   if (per_layer_inputs_) per_layer_inputs_->UpdateSequenceLength(new_length);
-  UpdateTokenTypeIds(new_length);
 }
 
 void DecoderState::RewindTo(size_t index) {
