@@ -5,6 +5,8 @@
 #include "multi_modal.h"
 #include "models/io/default_position_inputs.h"
 #include "models/io/qwen_vl_position_inputs.h"
+#include "openvino_multi_modal.h"
+#include "openvino_vision_merger.h"
 #include <cstring>
 #include <algorithm>
 #include <numeric>
@@ -823,6 +825,12 @@ MultiModalPipelineState::MultiModalPipelineState(const MultiModalLanguageModel& 
   embedding_state_ = std::make_unique<EmbeddingState>(model, params);
   decoder_state_ = std::make_unique<DecoderState>(model_, sequence_lengths, params);
 
+  // OpenVINO-partitioned VLMs run their vision graph(s) and merge image features on the host via a
+  // per-family strategy, instead of fusing them inside the embedding graph.
+  if (IsOpenVINOPartitioned(*model_.config_)) {
+    vision_merger_ = CreateOpenVINOVisionMerger(static_cast<const OpenVINOMultiModalModel&>(model_), params);
+  }
+
   if (vision_state_ != nullptr && model_.config_->model.vision.adapter_filename.has_value() && num_image_tokens_ > 0) {
     const auto lora_adapter = (model_.config_->config_path / fs::path(*model_.config_->model.vision.adapter_filename)).string();
     adapters_->LoadAdapter(lora_adapter.c_str(), vision_adapter_name_);
@@ -844,6 +852,9 @@ void MultiModalPipelineState::SetExtraInputs(const std::vector<ExtraInput>& extr
   }
   if (model_.speech_session_) {
     speech_state_->SetExtraInputs(extra_inputs, num_audio_tokens_);
+  }
+  if (vision_merger_) {
+    vision_merger_->RunVision(extra_inputs);
   }
   embedding_state_->SetExtraInputs(num_images_, num_image_tokens_, num_audio_tokens_);
   // Set the grid tensors for Qwen2-VL if present
@@ -920,6 +931,12 @@ DeviceSpan<float> MultiModalPipelineState::Run(int current_length, DeviceSpan<in
       embedding_state_->per_layer_inputs_->ReuseEmbeddingsBuffer(*decoder_state_->per_layer_inputs_);
     }
     embedding_state_->Run(current_length, next_tokens, next_indices);
+
+    // OpenVINO-partitioned VLMs merge image features into the (text-only) embeddings on the host, after
+    // the embedding graph runs and before the decoder consumes the shared inputs_embeds buffer.
+    if (vision_merger_) {
+      vision_merger_->Merge(*decoder_state_->inputs_embeds_.Get(), *embedding_state_->input_ids_.Get());
+    }
 
     auto logits = chunk_prefill
                       ? decoder_state_->RunPrefillWithChunking(current_length, next_tokens, next_indices, chunk_size_opt.value())

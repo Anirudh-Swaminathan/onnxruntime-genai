@@ -22,6 +22,8 @@
 
 namespace Generators {
 
+struct OpenVINOVisionMerger;
+
 struct MultiModalLanguageModel : Model {
   MultiModalLanguageModel(std::unique_ptr<Config> config, OrtEnv& ort_env, bool vision, bool speech);
   MultiModalLanguageModel(const MultiModalLanguageModel&) = delete;
@@ -235,6 +237,10 @@ struct MultiModalPipelineState : State {
   std::unique_ptr<DecoderState> decoder_state_;
   std::shared_ptr<Adapters> adapters_;
   bool is_prompt_{true};
+
+  // Host-side vision production + image-feature merge for OpenVINO-partitioned VLMs. Null for native
+  // models, which fuse image features inside the embedding graph instead.
+  std::unique_ptr<OpenVINOVisionMerger> vision_merger_;
 
   const std::string vision_adapter_name_{"vision"};
   const std::string speech_adapter_name_{"speech"};
