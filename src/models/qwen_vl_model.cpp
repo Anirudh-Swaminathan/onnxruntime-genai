@@ -188,6 +188,8 @@ void Qwen2_5_VL_PipelineState::InjectVisionEmbeddings(const std::string& embeddi
 
   ValidateVisionEmbeddingShapes(shape, embeddings_info->GetElementCount(), vision_shape, total_tokens);
 
+  // Collect the flat row indices of the image placeholder tokens so the shared host-merge helper can
+  // scatter the produced vision features into them, in order.
   std::vector<int64_t> target_token_rows;
   target_token_rows.reserve(total_tokens);
   for (size_t i = 0; i < total_tokens; ++i) {
@@ -195,7 +197,7 @@ void Qwen2_5_VL_PipelineState::InjectVisionEmbeddings(const std::string& embeddi
   }
 
   const int64_t num_vision_tokens = vision_shape[0];
-  // Accumulate: this runs on every decode step, and later no-op calls must not reset the running total.
+  // Accumulate; fires every decode step, must not reset the running total
   image_embed_consumed_ += MergeImageFeaturesIntoEmbeddings(*embeddings_ortvalue, *image_features_value_, target_token_rows);
 
   // Warn if there's a mismatch between image tokens and vision features
