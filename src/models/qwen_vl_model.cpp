@@ -1,9 +1,9 @@
 #include "qwen_vl_model.h"
 #include "model.h"
+#include "multi_modal_features.h"
 #include "onnxruntime_api.h"
 #include "../logging.h"
 #include <iostream>
-#include <cstring>
 #include <algorithm>
 
 namespace Generators {
@@ -171,10 +171,11 @@ void Qwen2_5_VL_PipelineState::InjectVisionEmbeddings(const std::string& embeddi
     throw std::runtime_error("Vision embedding injection: embeddings output must have float elements");
   }
   auto shape = embeddings_info->GetShape();
-
   auto vision_shape = image_features_value_->GetTensorTypeAndShapeInfo()->GetShape();
 
-  constexpr int32_t image_token_id = 151655;
+  // Default to the Qwen2-VL image token id (151655) when the config does not specify one
+  const int32_t image_token_id =
+      vl_model_.config_->model.image_token_id != 0 ? vl_model_.config_->model.image_token_id : 151655;
 
   if (!input_ids_ || !input_ids_->Get()) {
     throw std::runtime_error("Vision embedding injection: input_ids not available");
@@ -183,23 +184,19 @@ void Qwen2_5_VL_PipelineState::InjectVisionEmbeddings(const std::string& embeddi
   OrtValue* input_ids_ortvalue = input_ids_->Get();
   auto input_ids_info = input_ids_ortvalue->GetTensorTypeAndShapeInfo();
   const int32_t* token_ids_cpu = input_ids_ortvalue->GetTensorData<int32_t>();
-
   const size_t total_tokens = input_ids_info->GetElementCount();
-  ValidateVisionEmbeddingShapes(shape, embeddings_info->GetElementCount(), vision_shape, total_tokens);
-  float* embeddings_data = embeddings_ortvalue->GetTensorMutableData<float>();
-  const float* vision_data = image_features_value_->GetTensorData<float>();
-  const int64_t num_vision_tokens = vision_shape[0];
-  const int64_t embedding_dim = shape.back();
-  const int64_t vision_dim = vision_shape[1];
 
+  ValidateVisionEmbeddingShapes(shape, embeddings_info->GetElementCount(), vision_shape, total_tokens);
+
+  std::vector<int64_t> target_token_rows;
+  target_token_rows.reserve(total_tokens);
   for (size_t i = 0; i < total_tokens; ++i) {
-    if (token_ids_cpu[i] == image_token_id && image_embed_consumed_ < static_cast<size_t>(num_vision_tokens)) {
-      std::memcpy(embeddings_data + (i * embedding_dim),
-                  vision_data + (image_embed_consumed_ * vision_dim),
-                  vision_dim * sizeof(float));
-      image_embed_consumed_++;
-    }
+    if (token_ids_cpu[i] == image_token_id) target_token_rows.push_back(static_cast<int64_t>(i));
   }
+
+  const int64_t num_vision_tokens = vision_shape[0];
+  // Accumulate: this runs on every decode step, and later no-op calls must not reset the running total.
+  image_embed_consumed_ += MergeImageFeaturesIntoEmbeddings(*embeddings_ortvalue, *image_features_value_, target_token_rows);
 
   // Warn if there's a mismatch between image tokens and vision features
   if (image_embed_consumed_ != static_cast<size_t>(num_vision_tokens)) {
