@@ -1,5 +1,6 @@
 #include "qwen_vl_model.h"
 #include "model.h"
+#include "multi_modal_features.h"
 #include "onnxruntime_api.h"
 #include "../logging.h"
 #include <iostream>
@@ -166,21 +167,10 @@ void Qwen2_5_VL_PipelineState::InjectVisionEmbeddings(const std::string& embeddi
   }
 
   OrtValue* embeddings_ortvalue = it->second.get();
-  auto shape = embeddings_ortvalue->GetTensorTypeAndShapeInfo()->GetShape();
-  float* embeddings_data = embeddings_ortvalue->GetTensorMutableData<float>();
 
-  auto vision_shape = image_features_value_->GetTensorTypeAndShapeInfo()->GetShape();
-  const float* vision_data = image_features_value_->GetTensorData<float>();
-
-  const int64_t embedding_dim = shape[2];
-  const int64_t num_vision_tokens = vision_shape[0];
-  const int64_t vision_dim = vision_shape[1];
-  if (vision_dim != embedding_dim) {
-    throw std::runtime_error("Vision embedding injection: dimension mismatch - vision_dim=" + std::to_string(vision_dim) +
-                             ", embedding_dim=" + std::to_string(embedding_dim));
-  }
-
-  constexpr int32_t image_token_id = 151655;
+  // Default to the Qwen2-VL image token id (151655) when the config does not specify one
+  const int32_t image_token_id =
+      vl_model_.config_->model.image_token_id != 0 ? vl_model_.config_->model.image_token_id : 151655;
 
   if (!input_ids_ || !input_ids_->Get()) {
     throw std::runtime_error("Vision embedding injection: input_ids not available");
@@ -193,14 +183,15 @@ void Qwen2_5_VL_PipelineState::InjectVisionEmbeddings(const std::string& embeddi
   int64_t total_tokens = 1;
   for (auto dim : input_ids_shape) total_tokens *= dim;
 
+  // Collect the flat row indices of the image placeholder tokens so the shared host-merge helper can
+  // scatter the produced vision features into them, in order.
+  std::vector<int64_t> target_token_rows;
   for (int64_t i = 0; i < total_tokens; ++i) {
-    if (token_ids_cpu[i] == image_token_id && image_embed_consumed_ < static_cast<size_t>(num_vision_tokens)) {
-      std::memcpy(embeddings_data + (i * embedding_dim),
-                  vision_data + (image_embed_consumed_ * vision_dim),
-                  vision_dim * sizeof(float));
-      image_embed_consumed_++;
-    }
+    if (token_ids_cpu[i] == image_token_id) target_token_rows.push_back(i);
   }
+
+  const int64_t num_vision_tokens = image_features_value_->GetTensorTypeAndShapeInfo()->GetShape().front();
+  image_embed_consumed_ = MergeImageFeaturesIntoEmbeddings(*embeddings_ortvalue, *image_features_value_, target_token_rows);
 
   // Warn if there's a mismatch between image tokens and vision features
   if (image_embed_consumed_ != static_cast<size_t>(num_vision_tokens)) {
