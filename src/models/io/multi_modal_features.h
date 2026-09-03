@@ -19,6 +19,13 @@ struct MultiModalFeatures {
   void Update(bool is_prompt);
   void ReuseFeaturesBuffer(MultiModalFeatures& other);
 
+  // Re-derives shape_ for a new turn's (batch_size, num_feature_tokens) and reallocates the Output-mode
+  // features tensor, writing through the existing index_ rather than appending a new slot. This is what
+  // makes a second SetExtraInputs() call (a later conversation turn) safe: without it, constructing a
+  // fresh MultiModalFeatures and calling Add() again would duplicate and misindex the state's input/
+  // output arrays. Call this instead of construct-then-Add() whenever the object already exists.
+  void Rebind(int64_t batch_size, int64_t num_feature_tokens);
+
   // Pre-allocate an empty features tensor for Input mode when no source session provides one.
   // Used when the embedding model requires an input (e.g., audio_features) but no corresponding
   // encoder session exists.

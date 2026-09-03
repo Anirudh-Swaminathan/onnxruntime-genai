@@ -764,9 +764,9 @@ void Generator::AppendTokens(cpu_span<const int32_t> input_ids) {
   }
 
   // Set any extra inputs (those defined in extra_inputs and those defined in the PresetExtraInputs registry)
-  if (set_extra_inputs_) {
+  if (extra_inputs_pending_) {
     state_->SetExtraInputs(extra_inputs_);
-    set_extra_inputs_ = false;
+    extra_inputs_pending_ = false;
   }
 
   // Continuous decoding - let the decoding strategy realign any deferred per-round state with the
@@ -795,9 +795,9 @@ void Generator::AppendTokens(DeviceSpan<int32_t> input_ids) {
   if (search_->GetSequenceLength() != 0 && state_->params_->search.batch_size > 1)
     throw std::runtime_error("AppendTokens can only be called once for batch_size > 1. To call AppendTokens again, use RewindToLength(0)");
 
-  if (set_extra_inputs_) {
+  if (extra_inputs_pending_) {
     state_->SetExtraInputs(extra_inputs_);
-    set_extra_inputs_ = false;
+    extra_inputs_pending_ = false;
   }
 
   search_->AppendTokens(input_ids);
@@ -809,6 +809,12 @@ void Generator::SetInputs(const NamedTensors& named_tensors) {
   if (ModelType::IsLLM(model_->config_->model.type) || ModelType::IsPipe(model_->config_->model.type)) {
     throw std::runtime_error("Please use generator.AppendTokens for " + model_->config_->model.type + ". SetInputs is not supported for this model type.");
   }
+
+  // Each call is a complete turn payload: clear whatever the previous turn left bound (e.g. a prior
+  // turn's pixel_values) so a turn with fewer/no images cannot inherit stale extra inputs. This is safe
+  // because ExtraInputs owns its own copy of everything it binds (see ExtraInputs::Add) rather than
+  // borrowing from this vector.
+  extra_inputs_.clear();
 
   cpu_span<int32_t> input_ids;
   for (const auto& [name, tensor] : named_tensors) {
@@ -824,10 +830,8 @@ void Generator::SetInputs(const NamedTensors& named_tensors) {
   }
 
   // Set any extra inputs (those defined in extra_inputs and those defined in the PresetExtraInputs registry)
-  if (set_extra_inputs_) {
-    state_->SetExtraInputs(extra_inputs_);
-    set_extra_inputs_ = false;
-  }
+  state_->SetExtraInputs(extra_inputs_);
+  extra_inputs_pending_ = false;
 
   // Append tokens and run ComputeLogits after setting all other possible inputs
   if (input_ids.size() > 0) {

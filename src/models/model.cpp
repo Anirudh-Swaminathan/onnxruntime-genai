@@ -173,12 +173,43 @@ void State::Run(OrtSession& session, bool graph_capture_this_run, int graph_capt
     run_options_->AddConfigEntry("disable_synchronize_execution_providers", "1");
   }
 
+  ValidateInputArrays();
+
   session.Run(run_options_.get(), input_names_.data(), inputs_.data(), input_names_.size(),
               output_names_.data(), outputs_.data(), output_names_.size());
 
   extra_outputs_.RegisterOutputs();
 
   DumpOutputs();
+}
+
+void State::ValidateInputArrays() {
+  // Only re-scan when the array grew/shrank since the last call — that is the event a broken Add()
+  // implementation (appending instead of rebinding) would produce. A steady-state decode loop where
+  // input_names_.size() does not change pays one size_t comparison per step, not a rescan.
+  if (input_names_.size() == last_validated_input_count_) {
+    return;
+  }
+
+  std::unordered_map<std::string_view, size_t> first_index_of_name;
+  first_index_of_name.reserve(input_names_.size());
+  for (size_t i = 0; i < input_names_.size(); ++i) {
+    if (inputs_[i] == nullptr) {
+      throw std::runtime_error(std::string("State::Run: input '") + input_names_[i] + "' (index " +
+                               std::to_string(i) + ") is bound to a null tensor. A reserved slot " +
+                               "(e.g. MultiModalFeatures::Add or Embeddings::Add) was never filled before " +
+                               "this Run() call.");
+    }
+    const auto [it, inserted] = first_index_of_name.emplace(input_names_[i], i);
+    if (!inserted) {
+      throw std::runtime_error(std::string("State::Run: duplicate input name '") + input_names_[i] +
+                               "' bound at indices " + std::to_string(it->second) + " and " + std::to_string(i) +
+                               ". An Add() call appended a new slot instead of rebinding the existing one for " +
+                               "a repeated name.");
+    }
+  }
+
+  last_validated_input_count_ = input_names_.size();
 }
 
 void State::SetRunOption(const char* key, const char* value) {

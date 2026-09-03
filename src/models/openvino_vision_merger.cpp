@@ -32,6 +32,16 @@ std::unique_ptr<OrtValue> WrapCpuTensor(std::vector<T>& data, std::span<const in
   return OrtValue::CreateTensor<T>(*memory_info, std::span<T>(data.data(), data.size()), shape);
 }
 
+// Number of feature rows in a [num_tokens, hidden] or [1, num_tokens, hidden] tensor, robust to either
+// rank (mirrors the same computation inside MergeImageFeaturesIntoEmbeddings).
+size_t NumFeatureRows(const OrtValue& features) {
+  const auto shape = features.GetTensorTypeAndShapeInfo()->GetShape();
+  if (shape.empty() || shape.back() <= 0) return 0;
+  int64_t element_count = 1;
+  for (int64_t dim : shape) element_count *= dim;
+  return static_cast<size_t>(element_count / shape.back());
+}
+
 // Gemma3: single vision session (pixel_values -> image_features). Image placeholder tokens are marked
 // by token_type_ids == 1 (produced by GemmaImageProcessor); Gemma configs carry no image_token_id, so the
 // token_type_ids channel is used to locate the image rows for host-side feature injection.
@@ -89,7 +99,15 @@ void Gemma3OpenVINOVisionMerger::Merge(OrtValue& inputs_embeds, const OrtValue& 
     if (token_type_ids_[i] == 1) image_token_rows.push_back(static_cast<int64_t>(i));
   }
 
-  MergeImageFeaturesIntoEmbeddings(inputs_embeds, *image_features_, image_token_rows);
+  const size_t consumed = MergeImageFeaturesIntoEmbeddings(inputs_embeds, *image_features_, image_token_rows);
+  const size_t num_vision_tokens = NumFeatureRows(*image_features_);
+  if (image_token_rows.size() != num_vision_tokens || consumed != num_vision_tokens) {
+    throw std::runtime_error("Gemma3OpenVINOVisionMerger::Merge: consumed " + std::to_string(consumed) + " of " +
+                             std::to_string(num_vision_tokens) + " vision feature rows, with " +
+                             std::to_string(image_token_rows.size()) + " image placeholder (token_type_ids == 1) " +
+                             "tokens found. A mismatch here means the image was merged at the wrong offset or " +
+                             "with a stale payload.");
+  }
 }
 
 // ----------------------------------------------------------------------------
@@ -408,7 +426,15 @@ void Qwen3_5OpenVINOVisionMerger::Merge(OrtValue& inputs_embeds, const OrtValue&
     }
   }
 
-  MergeImageFeaturesIntoEmbeddings(inputs_embeds, *image_features_, image_token_rows);
+  const size_t consumed = MergeImageFeaturesIntoEmbeddings(inputs_embeds, *image_features_, image_token_rows);
+  const size_t num_vision_tokens = NumFeatureRows(*image_features_);
+  if (image_token_rows.size() != num_vision_tokens || consumed != num_vision_tokens) {
+    throw std::runtime_error("Qwen3_5OpenVINOVisionMerger::Merge: consumed " + std::to_string(consumed) + " of " +
+                             std::to_string(num_vision_tokens) + " vision feature rows, with " +
+                             std::to_string(image_token_rows.size()) + " image placeholder (input_ids == " +
+                             std::to_string(image_token_id) + ") tokens found. A mismatch here means the image " +
+                             "was merged at the wrong offset or with a stale payload.");
+  }
 }
 
 }  // namespace

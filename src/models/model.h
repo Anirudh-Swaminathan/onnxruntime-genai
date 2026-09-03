@@ -103,6 +103,17 @@ struct State {
   OrtSession* graph_capture_session_{nullptr};
   std::shared_ptr<Adapters> adapters_;
   ExtraOutputs extra_outputs_;
+
+  // Validates input_names_/inputs_ immediately before they are handed to ORT in Run(): no duplicate
+  // names (the signature of an Add() that appended a new slot instead of rebinding an existing one)
+  // and no null tensor pointers (a reserved slot — MultiModalFeatures::Add, Embeddings::Add — left
+  // unfilled). Both are binding defects regardless of model type; this is a permanent invariant check,
+  // not scaffolding for any particular feature. Throws with the offending name/index rather than
+  // letting ORT report an opaque shape error. Cheap in the steady state: it only re-scans when
+  // input_names_.size() has changed since the last call, so a decode loop pays one size comparison
+  // per step, not a rescan.
+  void ValidateInputArrays();
+  size_t last_validated_input_count_{~0ULL};
 };
 
 
