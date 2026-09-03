@@ -140,10 +140,16 @@ void VisionState::SetExtraInputs(const std::vector<ExtraInput>& extra_inputs, co
   num_image_tokens_ = num_image_tokens;
   num_images_ = num_images;
 
-  image_features_ = std::make_unique<MultiModalFeatures>(*this, MultiModalFeatures::Mode::Output,  // Optional model input
-                                                         model_.config_->model.vision.outputs.image_features,
-                                                         num_images_, num_image_tokens_);
-  image_features_->Add();
+  // Construct once (reserving the output slot via Add()); every later call rebinds the same object in
+  // place instead, so a second turn cannot duplicate or misindex state_.outputs_.
+  if (!image_features_) {
+    image_features_ = std::make_unique<MultiModalFeatures>(*this, MultiModalFeatures::Mode::Output,  // Optional model input
+                                                            model_.config_->model.vision.outputs.image_features,
+                                                            num_images_, num_image_tokens_);
+    image_features_->Add();
+  } else {
+    image_features_->Rebind(num_images_, num_image_tokens_);
+  }
   extra_inputs_.Add(extra_inputs, model_.vision_session_->GetInputNames());
 }
 
@@ -590,10 +596,14 @@ void SpeechState::SetExtraInputs(const std::vector<ExtraInput>& extra_inputs, co
 
   // Allocate 3D [batch, num_audio_tokens, hidden_size] matching the speech ONNX model's
   // output rank. Will be reshaped to 2D before passing to the embedding model.
-  audio_features_ = std::make_unique<MultiModalFeatures>(*this, MultiModalFeatures::Mode::Output,
-                                                         model_.config_->model.speech.outputs.audio_features,
-                                                         params_->BatchBeamSize(), num_audio_tokens_);
-  audio_features_->Add();
+  if (!audio_features_) {
+    audio_features_ = std::make_unique<MultiModalFeatures>(*this, MultiModalFeatures::Mode::Output,
+                                                           model_.config_->model.speech.outputs.audio_features,
+                                                           params_->BatchBeamSize(), num_audio_tokens_);
+    audio_features_->Add();
+  } else {
+    audio_features_->Rebind(params_->BatchBeamSize(), num_audio_tokens_);
+  }
   extra_inputs_.Add(extra_inputs, model_.speech_session_->GetInputNames());
 }
 
@@ -626,23 +636,34 @@ void EmbeddingState::SetExtraInputs(const int64_t num_images, const int64_t num_
   num_audio_tokens_ = num_audio_tokens;
 
   if (model_.vision_session_) {
-    image_features_ = std::make_unique<MultiModalFeatures>(*this, MultiModalFeatures::Mode::Input,  // Optional model input
-                                                           model_.config_->model.embedding.inputs.image_features,
-                                                           num_images, num_image_tokens_);
-    image_features_->Add();
+    if (!image_features_) {
+      image_features_ = std::make_unique<MultiModalFeatures>(*this, MultiModalFeatures::Mode::Input,  // Optional model input
+                                                             model_.config_->model.embedding.inputs.image_features,
+                                                             num_images, num_image_tokens_);
+      image_features_->Add();
+    } else {
+      image_features_->Rebind(num_images, num_image_tokens_);
+    }
   }
   if (model_.speech_session_) {
-    audio_features_ = std::make_unique<MultiModalFeatures>(*this, MultiModalFeatures::Mode::Input,  // Optional model input
-                                                           model_.config_->model.embedding.inputs.audio_features,
-                                                           -1, num_audio_tokens_);
-    audio_features_->Add();
+    if (!audio_features_) {
+      audio_features_ = std::make_unique<MultiModalFeatures>(*this, MultiModalFeatures::Mode::Input,  // Optional model input
+                                                             model_.config_->model.embedding.inputs.audio_features,
+                                                             -1, num_audio_tokens_);
+      audio_features_->Add();
+    } else {
+      audio_features_->Rebind(-1, num_audio_tokens_);
+    }
   } else if (model_.session_info_.HasInput(model_.config_->model.embedding.inputs.audio_features)) {
-    // No speech session, but embedding model requires audio_features — provide empty tensor with shape (0, hidden_size)
-    audio_features_ = std::make_unique<MultiModalFeatures>(*this, MultiModalFeatures::Mode::Input,
-                                                           model_.config_->model.embedding.inputs.audio_features,
-                                                           -1, 0);
-    audio_features_->Add();
-    // Pre-allocate an empty tensor since there's no speech session to provide one via ReuseFeaturesBuffer
+    // No speech session, but embedding model requires audio_features — provide empty tensor with shape
+    // (0, hidden_size). Shape never varies by turn, so no Rebind path is needed: construct once, and
+    // AllocateEmptyFeatures is already idempotent (skips if already allocated).
+    if (!audio_features_) {
+      audio_features_ = std::make_unique<MultiModalFeatures>(*this, MultiModalFeatures::Mode::Input,
+                                                             model_.config_->model.embedding.inputs.audio_features,
+                                                             -1, 0);
+      audio_features_->Add();
+    }
     audio_features_->AllocateEmptyFeatures();
   }
 }
@@ -728,31 +749,72 @@ void DecoderState::AddTokenTypeIds() {
   input_names_.push_back(model_.config_->model.decoder.inputs.token_type_ids.c_str());
 }
 
-void DecoderState::SetPromptTokenTypeIds(std::span<const int32_t> token_type_ids) {
-  // Cache the prompt markers; UpdateTokenTypeIds applies them once the input is sized to the prompt.
-  prompt_token_type_ids_.assign(token_type_ids.begin(), token_type_ids.end());
+void DecoderState::SetTurnTokenTypeIds(std::span<const int32_t> token_type_ids) {
+  // Cache this turn's markers; UpdateTokenTypeIds applies and then consumes them once the input is
+  // sized to this turn's payload.
+  turn_token_type_ids_.assign(token_type_ids.begin(), token_type_ids.end());
 }
 
 void DecoderState::UpdateTokenTypeIds(size_t new_length) {
   if (!token_type_ids_) return;
-  // Reallocate to the current sequence length. Generated tokens are always text (token_type_id 0); the
-  // prompt step reinstates the cached image-placeholder markers when their length matches.
+  // Reallocate to the current sequence length. Generated tokens are always text (token_type_id 0); a
+  // step that just received turn markers (via SetTurnTokenTypeIds) reinstates them here.
   const int64_t batch_size = inputs_embeds_.GetShape()[0];
   auto type = token_type_ids_->GetTensorTypeAndShapeInfo()->GetElementType();
   std::array<int64_t, 2> shape{batch_size, static_cast<int64_t>(new_length)};
   token_type_ids_ = OrtValue::CreateTensor(model_.allocator_cpu_, shape, type);
   ZeroTokenTypeIds(*token_type_ids_);
   const size_t count = token_type_ids_->GetTensorTypeAndShapeInfo()->GetElementCount();
-  if (!prompt_token_type_ids_.empty() && prompt_token_type_ids_.size() == count) {
+  if (!turn_token_type_ids_.empty()) {
+    if (turn_token_type_ids_.size() != count) {
+      throw std::runtime_error("DecoderState::UpdateTokenTypeIds: turn_token_type_ids_ length (" +
+                               std::to_string(turn_token_type_ids_.size()) +
+                               ") does not match this step's token_type_ids element count (" +
+                               std::to_string(count) + ").");
+    }
     if (type == ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64) {
       auto* dst = token_type_ids_->GetTensorMutableData<int64_t>();
-      for (size_t i = 0; i < count; ++i) dst[i] = prompt_token_type_ids_[i];
+      for (size_t i = 0; i < count; ++i) dst[i] = turn_token_type_ids_[i];
     } else {
       auto* dst = token_type_ids_->GetTensorMutableData<int32_t>();
-      for (size_t i = 0; i < count; ++i) dst[i] = prompt_token_type_ids_[i];
+      for (size_t i = 0; i < count; ++i) dst[i] = turn_token_type_ids_[i];
     }
+    // Consume-once: a later step of coincidentally equal length (or the next turn, if it carries no
+    // token_type_ids of its own) must not silently inherit these markers.
+    turn_token_type_ids_.clear();
   }
   inputs_[token_type_ids_index_] = token_type_ids_.get();
+}
+
+void DecoderState::TokenTypeIdsUseChunkView(size_t offset, size_t length) {
+  if (!token_type_ids_) return;
+  const auto info = token_type_ids_->GetTensorTypeAndShapeInfo();
+  const auto shape = info->GetShape();
+  if (shape.size() != 2 || shape[0] != 1) {
+    throw std::runtime_error("DecoderState::TokenTypeIdsUseChunkView requires a batch size of 1 for token_type_ids.");
+  }
+  if (offset + length > static_cast<size_t>(shape[1])) {
+    throw std::runtime_error("DecoderState::TokenTypeIdsUseChunkView: requested chunk exceeds the token_type_ids sequence length.");
+  }
+
+  const auto type = info->GetElementType();
+  const size_t element_size = Ort::SizeOf(type);
+  auto* raw = static_cast<uint8_t*>(token_type_ids_->GetTensorMutableRawData());
+
+  std::array<int64_t, 2> chunk_shape{1, static_cast<int64_t>(length)};
+  token_type_ids_chunk_view_ = OrtValue::CreateTensor(token_type_ids_->GetTensorMemoryInfo(),
+                                                      raw + offset * element_size,
+                                                      length * element_size,
+                                                      std::span<const int64_t>(chunk_shape), type);
+  inputs_[token_type_ids_index_] = token_type_ids_chunk_view_.get();
+}
+
+void DecoderState::TokenTypeIdsRestoreFullView() {
+  if (!token_type_ids_chunk_view_) return;
+  token_type_ids_chunk_view_ = nullptr;
+  if (token_type_ids_) {
+    inputs_[token_type_ids_index_] = token_type_ids_.get();
+  }
 }
 
 DeviceSpan<float> DecoderState::Run(int current_length, DeviceSpan<int32_t>& next_tokens, DeviceSpan<int32_t> next_indices) {
@@ -791,6 +853,12 @@ void DecoderState::PrepareEmbeddingsForPrefill(size_t new_length) {
   // buffers in one run; the decoder then consumes them chunk by chunk.
   inputs_embeds_.UpdateSequenceLength(new_length);
   if (per_layer_inputs_) per_layer_inputs_->UpdateSequenceLength(new_length);
+  // token_type_ids_ (OpenVINO-partitioned Gemma3) must likewise be sized to the full prompt and have
+  // this turn's markers applied here, before RunPrefillWithChunking's loop slices per-chunk views of
+  // it — otherwise every chunk would bind whatever stale/wrong-length tensor was left from a previous
+  // step, since the normal per-step UpdateInputsOutputs() (which calls UpdateTokenTypeIds) is skipped
+  // in favor of this chunking path.
+  UpdateTokenTypeIds(new_length);
 }
 
 DeviceSpan<float> DecoderState::RunPrefillWithChunking(int current_length, DeviceSpan<int32_t>& next_tokens,
@@ -819,6 +887,9 @@ DeviceSpan<float> DecoderState::RunPrefillWithChunking(int current_length, Devic
     // Feed only this chunk's slice of the pre-computed embeddings to the decoder.
     inputs_embeds_.UseChunkView(processed_tokens, current_chunk_size);
     if (per_layer_inputs_) per_layer_inputs_->UseChunkView(processed_tokens, current_chunk_size);
+    // token_type_ids_ (OpenVINO-partitioned Gemma3) must be sliced the same way, or every chunk after
+    // the first would see a stale/full-length tensor instead of its own slice of this turn's markers.
+    TokenTypeIdsUseChunkView(processed_tokens, current_chunk_size);
 
     // Graph capture is disabled during prefill chunking.
     State::Run(*model_.decoder_session_, /*graph_capture_this_run=*/false);
@@ -828,6 +899,7 @@ DeviceSpan<float> DecoderState::RunPrefillWithChunking(int current_length, Devic
 
   inputs_embeds_.RestoreFullView();
   if (per_layer_inputs_) per_layer_inputs_->RestoreFullView();
+  TokenTypeIdsRestoreFullView();
 
   // Logits of the last chunk contain the logits for the last prompt token.
   return logits_.Get();
@@ -903,6 +975,11 @@ void MultiModalPipelineState::SetExtraInputs(const std::vector<ExtraInput>& extr
   num_image_tokens_ = GetNumImageTokens(extra_inputs);
   num_audio_tokens_ = GetNumAudioTokens(extra_inputs, model_.config_->model.speech.inputs.audio_sizes);
   num_images_ = GetImageFeatureBatchSize(extra_inputs);
+  // This turn carries multimodal content to merge iff it actually has image or audio tokens. A later
+  // turn with neither (plain text) leaves this false and takes the generation-stage path in Run(),
+  // same as a plain text turn does today; only a turn that genuinely needs vision/speech re-enters the
+  // prompt-like path via this flag once is_prompt_ is no longer true.
+  merge_features_this_step_ = num_image_tokens_ > 0 || num_audio_tokens_ > 0;
 
   if (model_.vision_session_) {
     vision_state_->SetExtraInputs(extra_inputs, num_images_, num_image_tokens_);
@@ -913,13 +990,13 @@ void MultiModalPipelineState::SetExtraInputs(const std::vector<ExtraInput>& extr
   if (vision_merger_) {
     vision_merger_->RunVision(extra_inputs);
   }
-  // Forward the prompt's token_type_ids (image placeholder markers) to the decoder when its graph
-  // consumes them (OpenVINO-partitioned Gemma3). Text-only prompts have none, so the decoder keeps zeros.
+  // Forward this turn's token_type_ids (image placeholder markers) to the decoder when its graph
+  // consumes them (OpenVINO-partitioned Gemma3). A text-only turn has none, so the decoder keeps zeros.
   for (const auto& input : extra_inputs) {
     if (input.name == Config::Defaults::TokenTypeIdsName) {
       OrtValue* ttids = input.tensor->GetOrtTensor();
       const size_t count = ttids->GetTensorTypeAndShapeInfo()->GetElementCount();
-      decoder_state_->SetPromptTokenTypeIds(std::span<const int32_t>(ttids->GetTensorData<int32_t>(), count));
+      decoder_state_->SetTurnTokenTypeIds(std::span<const int32_t>(ttids->GetTensorData<int32_t>(), count));
       break;
     }
   }
@@ -955,13 +1032,22 @@ DeviceSpan<float> MultiModalPipelineState::Run(int current_length, DeviceSpan<in
   //   - input_ids, image_features, audio_features -> |embeddings_model| -> inputs_embeds
   //   - inputs_embeds -> |decoder_model| -> logits
 
-  embedding_state_->UpdateInputsOutputs(next_tokens, is_prompt_);
+  // True whenever this step should take the vision/merge path: either it is the very first step of
+  // this generator's lifetime (is_prompt_), or this turn's SetExtraInputs() found actual image/audio
+  // content to merge (merge_features_this_step_) — which happens on any later turn that carries
+  // multimodal content, not just the first. A later turn with no multimodal content (plain text) takes
+  // neither term and falls through to the generation-stage path below, same as today.
+  const bool merging_features_this_step = is_prompt_ || merge_features_this_step_;
+
+  embedding_state_->UpdateInputsOutputs(next_tokens, merging_features_this_step);
 
   // Prefill chunking (search.chunk_size): during the prompt stage the decoder can process the
-  // prompt embeddings in several smaller runs to bound peak memory usage.
+  // prompt embeddings in several smaller runs to bound peak memory usage. Gated on
+  // merging_features_this_step (not bare is_prompt_) so a later image turn long enough to warrant
+  // chunking keeps the same memory bound the first turn had.
   const auto& chunk_size_opt = params_->search.chunk_size;
   const size_t num_tokens = next_tokens.size();
-  const bool chunk_prefill = is_prompt_ && chunk_size_opt.has_value() && chunk_size_opt.value() > 0 &&
+  const bool chunk_prefill = merging_features_this_step && chunk_size_opt.has_value() && chunk_size_opt.value() > 0 &&
                              num_tokens > chunk_size_opt.value() && decoder_state_->SupportsPrefillChunking();
 
   if (chunk_prefill) {
@@ -970,7 +1056,7 @@ DeviceSpan<float> MultiModalPipelineState::Run(int current_length, DeviceSpan<in
     decoder_state_->UpdateInputsOutputs(next_tokens, current_length, next_indices);
   }
 
-  if (is_prompt_) {
+  if (merging_features_this_step) {
     if (num_image_tokens_ > 0 && vision_state_) {
       vision_state_->Run(current_length, next_tokens, next_indices);
     }
@@ -1010,8 +1096,15 @@ DeviceSpan<float> MultiModalPipelineState::Run(int current_length, DeviceSpan<in
                       : decoder_state_->Run(current_length, next_tokens, next_indices);
 
     is_prompt_ = false;
-    if (vision_state_) vision_state_.reset();  // The vision state is no longer needed in generation stage
-    if (speech_state_) speech_state_.reset();  // The speech state is no longer needed in generation stage
+    // Consumed for this step; a later turn's SetExtraInputs() re-sets it if that turn carries
+    // multimodal content. Without clearing it here, every decode step for the rest of this turn would
+    // otherwise keep re-entering this branch, since SetExtraInputs is not called again until the next
+    // turn's payload arrives.
+    merge_features_this_step_ = false;
+    // vision_state_/speech_state_ are intentionally kept alive (not reset) across turns: a later turn
+    // may carry a new image or audio payload and needs to run vision/speech again. The vision/speech
+    // *session* is owned by the Model and shared, so retaining this State costs one idle object per
+    // modality for the generator's lifetime, not a per-turn allocation.
 
     return logits;
   }

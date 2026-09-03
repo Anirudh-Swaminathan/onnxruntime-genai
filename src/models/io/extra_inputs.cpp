@@ -49,11 +49,31 @@ ExtraInputs::ExtraInputs(State& state)
 
 void ExtraInputs::Add(const std::vector<ExtraInput>& extra_inputs, const std::vector<std::string>& required_input_names) {
   std::unordered_set<std::string> required_input_names_set(required_input_names.begin(), required_input_names.end());
-  // Add extra user inputs
-  for (int i = 0; i < extra_inputs.size(); i++) {
-    if (required_input_names_set.empty() || required_input_names_set.count(extra_inputs[i].name)) {
-      state_.input_names_.push_back(extra_inputs[i].name.c_str());
-      state_.inputs_.push_back(extra_inputs[i].tensor->ort_tensor_.get());
+  // Add extra user inputs. Iterate in order so that a repeated name (e.g. two OgaGenerator_SetModelInput
+  // calls for the same input) binds the most recently supplied tensor.
+  for (size_t i = 0; i < extra_inputs.size(); i++) {
+    if (!required_input_names_set.empty() && !required_input_names_set.count(extra_inputs[i].name)) {
+      continue;
+    }
+
+    auto it = name_to_index_.find(extra_inputs[i].name);
+    if (it != name_to_index_.end()) {
+      // Already bound: rebind the existing slot in place instead of appending a new one, so a second
+      // SetExtraInputs call (e.g. a later conversation turn) cannot duplicate or misindex the state's
+      // input arrays.
+      const size_t idx = it->second;
+      owned_names_[idx] = extra_inputs[i].name;
+      owned_tensors_[idx] = extra_inputs[i].tensor;
+      state_.input_names_[state_slots_[idx]] = owned_names_[idx].c_str();
+      state_.inputs_[state_slots_[idx]] = owned_tensors_[idx]->ort_tensor_.get();
+    } else {
+      owned_names_.push_back(extra_inputs[i].name);
+      owned_tensors_.push_back(extra_inputs[i].tensor);
+      const size_t idx = owned_names_.size() - 1;
+      state_slots_.push_back(state_.input_names_.size());
+      state_.input_names_.push_back(owned_names_[idx].c_str());
+      state_.inputs_.push_back(owned_tensors_[idx]->ort_tensor_.get());
+      name_to_index_.emplace(owned_names_[idx], idx);
     }
   }
 

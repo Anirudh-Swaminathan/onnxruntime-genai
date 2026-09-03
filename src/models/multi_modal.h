@@ -196,10 +196,16 @@ struct DecoderState : State {
   void UpdateInputsOutputs(DeviceSpan<int32_t>& next_tokens, int current_length, DeviceSpan<int32_t> beam_indices, size_t new_length);
 
   // Binds/updates the decoder's optional token_type_ids input (OpenVINO-partitioned Gemma3). Values are
-  // 0 for text and 1 for image placeholder tokens; MultiModalPipelineState supplies the prompt markers.
+  // 0 for text and 1 for image placeholder tokens; MultiModalPipelineState supplies this turn's markers.
   void AddTokenTypeIds();
   void UpdateTokenTypeIds(size_t new_length);
-  void SetPromptTokenTypeIds(std::span<const int32_t> token_type_ids);
+  void SetTurnTokenTypeIds(std::span<const int32_t> token_type_ids);
+
+  // Prefill-chunking support for token_type_ids, mirroring Embeddings::UseChunkView/RestoreFullView:
+  // RunPrefillWithChunking slices inputs_embeds_ per chunk, and token_type_ids_ (when bound) must be
+  // sliced the same way or a stale/full-length tensor gets fed to every chunk after the first.
+  void TokenTypeIdsUseChunkView(size_t offset, size_t length);
+  void TokenTypeIdsRestoreFullView();
 
   const MultiModalLanguageModel& model_;
   Embeddings inputs_embeds_{*this, Embeddings::Mode::Input,  // Model input
@@ -207,8 +213,9 @@ struct DecoderState : State {
   std::unique_ptr<Embeddings> per_layer_inputs_;        // Optional model input (Gemma4: per-layer conditioning)
   std::unique_ptr<DefaultInputIDs> decoder_input_ids_;  // Optional model input (e.g., Gemma4 decoder needs input_ids)
   std::unique_ptr<OrtValue> token_type_ids_;            // Optional model input (OpenVINO-partitioned Gemma3)
+  std::unique_ptr<OrtValue> token_type_ids_chunk_view_; // Non-owning slice of token_type_ids_ during chunking
   size_t token_type_ids_index_{~0U};                    // Slot in state_.inputs_ for token_type_ids
-  std::vector<int32_t> prompt_token_type_ids_;          // Cached prompt markers, applied on the prompt step
+  std::vector<int32_t> turn_token_type_ids_;            // This turn's markers, consumed once by UpdateTokenTypeIds
   std::unique_ptr<PositionInputs> position_inputs_;     // Model input
   std::unique_ptr<KeyValueCache> kv_cache_;             // Model input (ModelManaged for stateful models)
   std::unique_ptr<RecurrentState> recurrent_state_;     // Model input (for hybrid models)
@@ -246,6 +253,11 @@ struct MultiModalPipelineState : State {
   std::unique_ptr<DecoderState> decoder_state_;
   std::shared_ptr<Adapters> adapters_;
   bool is_prompt_{true};
+  // True for the remainder of the current Run() call when this turn's SetExtraInputs() indicated
+  // multimodal content (images and/or audio), regardless of whether this is the very first turn.
+  // is_prompt_ alone only ever means "the first step of this generator's lifetime"; this flag is what
+  // lets a later conversation turn take the same feature-merging path turn 1 takes.
+  bool merge_features_this_step_{false};
 
   // Host-side vision production + image-feature merge for OpenVINO-partitioned VLMs. Null for native
   // models, which fuse image features inside the embedding graph instead.

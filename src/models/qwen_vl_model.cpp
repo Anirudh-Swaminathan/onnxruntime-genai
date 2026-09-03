@@ -65,7 +65,14 @@ Qwen2_5_VL_PipelineState::Qwen2_5_VL_PipelineState(const Qwen2_5_VL_PipelineMode
 void Qwen2_5_VL_PipelineState::SetExtraInputs(const std::vector<ExtraInput>& extra_inputs) {
   DecoderOnlyPipelineState::SetExtraInputs(extra_inputs);
 
-  if (vision_ran_ || !vl_model_.vision_pipeline_) return;
+  // Re-derived every call: this means "vision ran for the current payload", not "vision ever ran". A
+  // later turn with no pixel_values (plain text) must leave this false so OnStageComplete correctly
+  // skips injection, rather than a one-shot latch that silently keeps re-injecting the first turn's
+  // features (or that, worse, blocks a later turn's own image from ever running vision at all).
+  vision_ran_ = false;
+  image_embed_consumed_ = 0;
+
+  if (!vl_model_.vision_pipeline_) return;
 
   OrtValue* pixel_values_val = nullptr;
   OrtValue* image_grid_thw_val = nullptr;
@@ -132,6 +139,12 @@ void Qwen2_5_VL_PipelineState::SetExtraInputs(const std::vector<ExtraInput>& ext
     }
   }
 
+  // Reset the view before reassigning the backing buffer: image_features_value_ is a non-owning view
+  // over image_features_buffer_'s storage (see the member comment below), so reassigning the buffer
+  // while a previous turn's view still points at it would leave that view dangling for however briefly
+  // it persists.
+  image_features_value_.reset();
+
   try {
     image_features_buffer_ = vl_model_.vision_pipeline_->Run(pixel_data, pixel_shape_vec, grid_thw);
   } catch (const std::exception& e) {
@@ -193,13 +206,16 @@ void Qwen2_5_VL_PipelineState::InjectVisionEmbeddings(const std::string& embeddi
   const int64_t num_vision_tokens = image_features_value_->GetTensorTypeAndShapeInfo()->GetShape().front();
   image_embed_consumed_ = MergeImageFeaturesIntoEmbeddings(*embeddings_ortvalue, *image_features_value_, target_token_rows);
 
-  // Warn if there's a mismatch between image tokens and vision features
-  if (image_embed_consumed_ != static_cast<size_t>(num_vision_tokens)) {
-    if (g_log.enabled)
-      Log("warning", "Vision embedding mismatch: consumed " + std::to_string(image_embed_consumed_) +
-                         " of " + std::to_string(num_vision_tokens) + " available vision tokens. " +
-                         "This may indicate a mismatch between the number of image placeholders in the prompt " +
-                         "and the number of images provided.");
+  // A mismatch between placeholder tokens and produced vision features means the image was merged at
+  // the wrong offset or with a stale payload; this is a bug, not a warnable situation, and continuing
+  // would produce silently-garbled embeddings rather than a diagnosable failure.
+  if (image_embed_consumed_ != static_cast<size_t>(num_vision_tokens) ||
+      target_token_rows.size() != static_cast<size_t>(num_vision_tokens)) {
+    throw std::runtime_error("Vision embedding mismatch: consumed " + std::to_string(image_embed_consumed_) +
+                             " of " + std::to_string(num_vision_tokens) + " available vision tokens, with " +
+                             std::to_string(target_token_rows.size()) + " image placeholder tokens found. " +
+                             "This indicates a mismatch between the number of image placeholders in the prompt " +
+                             "and the number of images provided.");
   }
 }
 
