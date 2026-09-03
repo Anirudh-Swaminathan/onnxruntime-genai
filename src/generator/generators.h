@@ -158,7 +158,7 @@ struct Generator : LeakChecked<Generator> {
   std::unique_ptr<ConstrainedLogitsProcessor> guidance_logits_processor_;
 
   bool computed_logits_{};                       // Set to true in ComputeLogits() and false after appending a token to ensure a 1 to 1 call ratio
-  bool set_extra_inputs_{true};                  // Set to false once SetExtraInputs() is called once
+  bool extra_inputs_pending_{true};              // Set when extra_inputs_ holds an unconsumed turn payload; cleared once SetExtraInputs() runs
   std::shared_ptr<Tensor> hidden_states_input_;  // Kept alive while staged for the model's hidden_states input (MTP head)
 
   // Returns zero-filled stats when the model is not speculative.
