@@ -7,9 +7,9 @@
 #include <limits>
 #include <vector>
 
-#include "../generators.h"
+#include "generator/generators.h"
 #include "model.h"
-#include "multi_modal_features.h"
+#include "io/multi_modal_features.h"
 #include "openvino_multi_modal.h"
 #include "openvino_vision_merger.h"
 
