@@ -1,6 +1,6 @@
 #include "qwen_vl_model.h"
 #include "model.h"
-#include "multi_modal_features.h"
+#include "io/multi_modal_features.h"
 #include "onnxruntime_api.h"
 #include "../logging.h"
 #include <iostream>
