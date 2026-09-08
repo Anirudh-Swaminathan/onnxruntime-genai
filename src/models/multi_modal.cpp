@@ -1037,16 +1037,14 @@ DeviceSpan<float> MultiModalPipelineState::Run(int current_length, DeviceSpan<in
   //   - input_ids, image_features, audio_features -> |embeddings_model| -> inputs_embeds
   //   - inputs_embeds -> |decoder_model| -> logits
 
+  const bool has_multimodal_content = num_image_tokens_ != 0 || num_audio_tokens_ != 0;
+  const bool merging_features_this_step = is_prompt_ || has_multimodal_content;
   embedding_state_->UpdateInputsOutputs(next_tokens, merging_features_this_step);
 
   // Prefill chunking (search.chunk_size): during the prompt stage the decoder can process the
-  // prompt embeddings in several smaller runs to bound peak memory usage. Gated on
-  // merging_features_this_step (not bare is_prompt_) so a later image turn long enough to warrant
-  // chunking keeps the same memory bound the first turn had.
+  // prompt embeddings in several smaller runs to bound peak memory usage.
   const auto& chunk_size_opt = params_->search.chunk_size;
   const size_t num_tokens = next_tokens.size();
-  const bool has_multimodal_content = num_image_tokens_ != 0 || num_audio_tokens_ != 0;
-  const bool merging_features_this_step = is_prompt_ || has_multimodal_content;
   const bool chunk_prefill = merging_features_this_step && chunk_size_opt.has_value() && chunk_size_opt.value() > 0 &&
                              num_tokens > chunk_size_opt.value() && decoder_state_->SupportsPrefillChunking(merging_features_this_step);
 
@@ -1096,7 +1094,6 @@ DeviceSpan<float> MultiModalPipelineState::Run(int current_length, DeviceSpan<in
                       : decoder_state_->Run(current_length, next_tokens, next_indices);
 
     is_prompt_ = false;
-    has_multimodal_content = false;
     return logits;
   }
 
