@@ -74,7 +74,8 @@ struct DecoderOnlyPipelineState : State {
   // Virtual hook called after each pipeline stage completes, before next stage starts.
   // Allows derived classes to modify stage outputs (e.g., inject vision embeddings).
   // stage_id: ID of the stage that just completed
-  virtual void OnStageComplete(size_t stage_id) {}
+  // is_last_chunk: true only for the final (or only) prompt-processing chunk of this Run() call
+  virtual void OnStageComplete(size_t stage_id, bool is_last_chunk) {}
 
   // Stores all the outputs from the previous pipeline state(s)
   std::unordered_map<std::string, std::unique_ptr<OrtValue>> ortvalue_store_;
