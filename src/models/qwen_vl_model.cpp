@@ -70,6 +70,7 @@ void Qwen2_5_VL_PipelineState::SetExtraInputs(const std::vector<ExtraInput>& ext
   // features (or that, worse, blocks a later turn's own image from ever running vision at all).
   vision_ran_ = false;
   image_embed_consumed_ = 0;
+  image_placeholder_tokens_found_ = 0;
 
   if (!vl_model_.vision_pipeline_) return;
 
@@ -163,16 +164,16 @@ void Qwen2_5_VL_PipelineState::SetExtraInputs(const std::vector<ExtraInput>& ext
   vision_ran_ = true;
 }
 
-void Qwen2_5_VL_PipelineState::OnStageComplete(size_t stage_id) {
+void Qwen2_5_VL_PipelineState::OnStageComplete(size_t stage_id, bool is_last_chunk) {
   if (stage_id != 0 || !vision_ran_) return;
 
   const auto& embeddings_config = vl_model_.config_->model.decoder.pipeline[0];
   if (!embeddings_config.outputs.empty()) {
-    InjectVisionEmbeddings(embeddings_config.outputs[0]);
+    InjectVisionEmbeddings(embeddings_config.outputs[0], is_last_chunk);
   }
 }
 
-void Qwen2_5_VL_PipelineState::InjectVisionEmbeddings(const std::string& embeddings_output_name) {
+void Qwen2_5_VL_PipelineState::InjectVisionEmbeddings(const std::string& embeddings_output_name, bool is_last_chunk) {
   auto it = ortvalue_store_.find(embeddings_output_name);
   if (it == ortvalue_store_.end() || !it->second) {
     throw std::runtime_error("Vision embedding injection: embeddings output '" + embeddings_output_name + "' not found in ortvalue_store");
@@ -212,15 +213,14 @@ void Qwen2_5_VL_PipelineState::InjectVisionEmbeddings(const std::string& embeddi
   const int64_t num_vision_tokens = vision_shape[0];
   // Accumulate; fires every decode step, must not reset the running total
   image_embed_consumed_ += MergeImageFeaturesIntoEmbeddings(*embeddings_ortvalue, *image_features_value_, target_token_rows);
-
-  // A mismatch between placeholder tokens and produced vision features means the image was merged at
-  // the wrong offset or with a stale payload; this is a bug, not a warnable situation, and continuing
-  // would produce silently-garbled embeddings rather than a diagnosable failure.
-  if (image_embed_consumed_ != static_cast<size_t>(num_vision_tokens) ||
-      target_token_rows.size() != static_cast<size_t>(num_vision_tokens)) {
+  image_placeholder_tokens_found_ += target_token_rows.size();
+  
+  if (first_run_ && is_last_chunk &&
+      (image_embed_consumed_ != static_cast<size_t>(num_vision_tokens) ||
+       image_placeholder_tokens_found_ != static_cast<size_t>(num_vision_tokens))) {
     throw std::runtime_error("Vision embedding mismatch: consumed " + std::to_string(image_embed_consumed_) +
                              " of " + std::to_string(num_vision_tokens) + " available vision tokens, with " +
-                             std::to_string(target_token_rows.size()) + " image placeholder tokens found. " +
+                             std::to_string(image_placeholder_tokens_found_) + " image placeholder tokens found. " +
                              "This indicates a mismatch between the number of image placeholders in the prompt " +
                              "and the number of images provided.");
   }

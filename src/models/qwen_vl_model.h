@@ -57,16 +57,17 @@ struct Qwen2_5_VL_PipelineState : public DecoderOnlyPipelineState {
   void SetExtraInputs(const std::vector<ExtraInput>& extra_inputs) override;
 
  protected:
-  void OnStageComplete(size_t stage_id) override;
+  void OnStageComplete(size_t stage_id, bool is_last_chunk) override;
 
  private:
-  void InjectVisionEmbeddings(const std::string& embeddings_output_name);
+  void InjectVisionEmbeddings(const std::string& embeddings_output_name, bool is_last_chunk);
 
   const Qwen2_5_VL_PipelineModel& vl_model_;
   bool vision_ran_{false};
   std::unique_ptr<OrtValue> image_features_value_;
   std::vector<float> image_features_buffer_;  // backing storage for OrtValue
   size_t image_embed_consumed_{0};            // Track how many vision embeddings we've injected
+  size_t image_placeholder_tokens_found_{0};  // Cumulative placeholder tokens seen across all chunks
 };
 
 }  // namespace Generators
