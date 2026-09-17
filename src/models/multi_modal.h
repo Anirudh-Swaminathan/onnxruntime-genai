@@ -253,11 +253,6 @@ struct MultiModalPipelineState : State {
   std::unique_ptr<DecoderState> decoder_state_;
   std::shared_ptr<Adapters> adapters_;
   bool is_prompt_{true};
-  // True for the remainder of the current Run() call when this turn's SetExtraInputs() indicated
-  // multimodal content (images and/or audio), regardless of whether this is the very first turn.
-  // is_prompt_ alone only ever means "the first step of this generator's lifetime"; this flag is what
-  // lets a later conversation turn take the same feature-merging path turn 1 takes.
-  bool merge_features_this_step_{false};
 
   // Host-side vision production + image-feature merge for OpenVINO-partitioned VLMs. Null for native
   // models, which fuse image features inside the embedding graph instead.

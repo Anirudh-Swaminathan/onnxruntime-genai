@@ -62,14 +62,13 @@ void MultiModalFeatures::Add() {
 }
 
 void MultiModalFeatures::Rebind(int64_t batch_size, int64_t num_feature_tokens) {
-  // Mirror the constructor's shape derivation exactly (including the "batch_size <= 0 skips the batch
-  // dim even on a 3D session" rule), rather than trusting shape_.size() from a previous call: a turn's
-  // batch_size can drop to 0 (no images) or rise back above 0 later, and this must reproduce whatever a
-  // fresh construction would have chosen for the new value.
+  // Rederive shape like the constructor: batch_size may change across turns.
   const int64_t hidden_size = shape_.back();
   const auto dims = mode_ == MultiModalFeatures::Mode::Input
                         ? model_.session_info_.GetInputSymbolicShape(name_).size()
                         : model_.session_info_.GetOutputSymbolicShape(name_).size();
+  const int64_t old_count = features_ ? static_cast<int64_t>(features_->GetTensorTypeAndShapeInfo()->GetElementCount()) : 0;
+
   shape_.clear();
   if (dims == 3 && batch_size > 0) {
     shape_.push_back(batch_size);
@@ -77,36 +76,33 @@ void MultiModalFeatures::Rebind(int64_t batch_size, int64_t num_feature_tokens) 
   shape_.push_back(num_feature_tokens);
   shape_.push_back(hidden_size);
 
+  int64_t new_count = 1;
+  for (auto d : shape_) new_count *= d;
+
   if (mode_ == MultiModalFeatures::Mode::Output) {
+    // Same size: keep data (encoder overwrites it next Run() anyway).
+    auto old_features = (old_count == new_count && old_count > 0) ? std::move(features_) : nullptr;
     features_ = OrtValue::CreateTensor(model_.p_device_->GetAllocator(), shape_, type_);
+    if (old_features) {
+      ByteWrapTensor(*model_.p_device_, *features_).CopyFrom(ByteWrapTensor(*model_.p_device_, *old_features));
+    }
     state_.outputs_[index_] = features_.get();
   } else if (num_feature_tokens > 0) {
-    // Input mode, nonzero tokens: reset to the same "reserved, unfilled" state Add() establishes. A
-    // nonzero rebind only ever happens on a turn whose SetExtraInputs found real content — which is
-    // exactly the condition (MultiModalPipelineState::merge_features_this_step_) that guarantees the
-    // prompt-like path runs later this same turn and fills this slot via ReuseFeaturesBuffer before
-    // Run() reads it. Leaving it null here means State::Run's guard catches the (should-never-happen)
-    // case where that fill is skipped, instead of silently reusing a stale buffer from the previous turn.
+    // Nulled here; ReuseFeaturesBuffer fills it before Run() reads it this turn.
     features_.reset();
     state_.inputs_[index_] = nullptr;
   } else {
-    // Input mode, zero tokens: unlike the nonzero case, a turn with zero tokens for *this* feature is
-    // not guaranteed to reach ReuseFeaturesBuffer/AllocateEmptyFeatures — a turn with no multimodal
-    // content at all takes the generation-stage path in Run(), which never touches this slot again this
-    // turn. Bind a valid empty tensor immediately so that path still sees a well-formed input, mirroring
-    // what MultiModalFeatures::Update's "shrink to empty" branch does for the decode-step case.
+    // Zero tokens: turn may skip the merge path; bind an empty tensor now.
     features_ = OrtValue::CreateTensor(model_.p_device_inputs_->GetAllocator(), shape_, type_);
     state_.inputs_[index_] = features_.get();
   }
 }
 
 void MultiModalFeatures::Update(bool is_prompt) {
-  // Initialize empty features tensor for after-prompt input scenarios
-  // num_feature_tokens will be 0 when no image is provided
+  // Shrink to zero tokens once per prompt end; Rebind() then no-ops here.
   if (!is_prompt && shape_[shape_.size() - 2] > 0) {  // if num_image_tokens > 0
-    shape_[shape_.size() - 2] = 0;
-    features_ = OrtValue::CreateTensor(model_.p_device_inputs_->GetAllocator(), shape_, type_);
-    state_.inputs_[index_] = features_.get();
+    const int64_t batch_size = shape_.size() == 3 ? shape_[0] : -1;
+    Rebind(batch_size, 0);
   }
 }
 
