@@ -28,8 +28,9 @@ struct QwenImageProcessor : Processor {
   ort_extensions::OrtxObjectPtr<OrtxProcessor> processor_;
 
   ONNXTensorElementDataType pixel_values_type_;
-  int64_t patch_size_{14};            // Qwen2.5-VL uses 14, Qwen3-VL uses 16
-  bool requires_patch_image_{false};  // OpenVINO host vision expects PatchImage's patch layout
+  int64_t patch_size_{14};  // Qwen2.5-VL uses 14, Qwen3-VL uses 16
+  // OpenVINO host vision expects PatchImage's patch layout.
+  bool requires_patch_image_{false};
 };
 
 struct LingImageProcessor : QwenImageProcessor {
