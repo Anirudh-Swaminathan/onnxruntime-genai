@@ -338,7 +338,8 @@ class LFM3Model(LFM2Model):
 
     # VL, Audio, Omni and d1 checkpoints nest the decoder under model.language_model, and their remote code
     # registers the first auto class rather than AutoModelForCausalLM. With the embedding layer excluded the
-    # decoder is a stage of the second: LFM3VLModel builds lfm3_vl, and the runtime does not have the others yet.
+    # decoder is a stage of the second: LFM3VLModel builds lfm3_vl, LFM3AudioModel builds lfm3_audio, and the runtime
+    # does not have lfm3_omni yet.
     # d1-2B refuses exclude_embeds for now (check_d1_export), so its entry here only names the loader.
     MULTIMODAL: ClassVar[dict[str, tuple[str, str]]] = {
         "Lfm3VlForConditionalGeneration": ("AutoModelForImageTextToText", "lfm3_vl"),
@@ -559,7 +560,11 @@ class LFM2AudioModel(LFM2Model):
             from huggingface_hub import snapshot_download
 
             checkpoint_dir = snapshot_download(
-                source, cache_dir=self.cache_dir, token=self.hf_token, allow_patterns=["*.safetensors", "*.json"]
+                source,
+                cache_dir=self.cache_dir,
+                token=self.hf_token,
+                revision=self.revision,
+                allow_patterns=["*.safetensors", "*.json"],
             )
 
         index_path = os.path.join(checkpoint_dir, "model.safetensors.index.json")
