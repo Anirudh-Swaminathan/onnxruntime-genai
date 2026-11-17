@@ -52,7 +52,7 @@ The chat template writes `<|vision_start|><|image|><|vision_end|>` for each imag
 - Aspect ratios above 200:1. The image processor refuses them.
 - Images with a side above 16,384 pixels. onnxruntime-extensions refuses to decode them.
 - Execution providers other than CPU, CUDA and WebGPU, and `use_paged_attention=true`. The builder refuses them.
-- Window-sized caches. Every attention layer, the sliding-window ones included, keeps a KV cache of `search.max_length` tokens, so set `search.max_length` to the length you need.
+- Window-sized caches on WebGPU. There every attention layer keeps a KV cache of `search.max_length` tokens. On CPU and CUDA the 5 sliding-window layers keep only their 256-token window. On every provider the 6 full-attention layers keep `search.max_length` tokens, so set `search.max_length` to the length you need.
 - Long prompts in one WebGPU run. The prompt's logits must fit in about 4 GiB: about 8,000 tokens in fp32 and 16,000 in fp16, and one large image can give 16,384. Set the `chunk_size` search option (for example 4096) to run longer prompts in parts.
 
 On WebGPU, fp16 decoders drift from CPU: on 3 image prompts, 88 of 192 greedy tokens matched the CPU's. LFM3 text models drift the same way. fp32 matched all 192.

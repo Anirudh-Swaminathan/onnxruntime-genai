@@ -423,11 +423,9 @@ def test_lfm3_vl_decoder_on_another_provider_matches_cpu(test_data_path, tmp_pat
     np.testing.assert_allclose(features, expected_features, rtol=0, atol=1e-4)
 
 
-def test_lfm3_vl_builder_makes_a_working_pipeline(test_data_path, tmp_path):
-    # With exclude_embeds=true the model builder writes the vision and embedding models and processor_config.json.
-    # Run on the stand-in checkpoint of the builder tests, each image's features must match the vision math on the
-    # rows the runtime's processor wrote, and land on that image's <|image|> tokens.
-    torch = pytest.importorskip("torch")
+def _builder_tests():
+    """The LFM3-VL builder tests' module, or a skip when the builder cannot run here."""
+    pytest.importorskip("torch")
     pytest.importorskip("transformers")
     pytest.importorskip("onnx_ir")
     builder_tests_dir = str(Path(__file__).resolve().parents[1] / "builder")
@@ -439,18 +437,20 @@ def test_lfm3_vl_builder_makes_a_working_pipeline(test_data_path, tmp_path):
         pytest.skip("this onnxruntime cannot run com.microsoft:CausalConvWithState")
     import test_lfm3_vl as builder_tests  # noqa: PLC0415
 
+    return builder_tests
+
+
+def _build_stand_in_pipeline(test_data_path, tmp_path, ep="cpu", io_dtype=None, extra_options=None):
+    """The builder's lfm3_vl pipeline for the stand-in checkpoint of the builder tests, with this model's tokenizer."""
+    builder_tests = _builder_tests()
     config = builder_tests.stand_in_config(tmp_path)
     config.text_config.max_position_embeddings = 1024  # Room for the two images' 160 tokens
     config.text_config.head_dim = 16  # GroupQueryAttention runs head sizes that are multiples of 8
     tokenizer = json.loads((Path(_model_path(test_data_path)) / "tokenizer.json").read_text(encoding="utf-8"))
     config.image_token_id = next(t["id"] for t in tokenizer["added_tokens"] if t["content"] == IMAGE_TOKEN)
+    io_dtype = io_dtype or builder_tests.ir.DataType.FLOAT
     model, hf_model = builder_tests.build_pipeline(
-        tmp_path,
-        config,
-        builder_tests.ir.DataType.FLOAT,
-        builder_tests.ir.DataType.FLOAT,
-        "cpu",
-        {"exclude_embeds": True},
+        tmp_path, config, io_dtype, io_dtype, ep, {"exclude_embeds": True, **(extra_options or {})}
     )
     output = tmp_path / "model"
     output.mkdir()
@@ -458,6 +458,16 @@ def test_lfm3_vl_builder_makes_a_working_pipeline(test_data_path, tmp_path):
     model.make_genai_config(config, {}, os.fspath(output))
     for name in ("tokenizer.json", "tokenizer_config.json"):
         shutil.copy(Path(_model_path(test_data_path)) / name, output / name)
+    return output, config, hf_model
+
+
+def test_lfm3_vl_builder_makes_a_working_pipeline(test_data_path, tmp_path):
+    # With exclude_embeds=true the model builder writes the vision and embedding models and processor_config.json.
+    # Run on the stand-in checkpoint of the builder tests, each image's features must match the vision math on the
+    # rows the runtime's processor wrote, and land on that image's <|image|> tokens.
+    torch = pytest.importorskip("torch")
+    builder_tests = _builder_tests()
+    output, config, hf_model = _build_stand_in_pipeline(test_data_path, tmp_path)
 
     og_model = og.Model(os.fspath(output))
     # Images with different token counts, so a run given to the wrong image changes the run lengths
@@ -481,3 +491,49 @@ def test_lfm3_vl_builder_makes_a_working_pipeline(test_data_path, tmp_path):
     np.testing.assert_array_equal(embeds[is_image], features)
     generator.generate_next_token()
     assert generator.get_sequence(0).shape[0] == len(input_ids) + 1
+
+
+# The images give 160 tokens against the stand-in's 4-token window, so the prompt, its chunks and every step evict from
+# the window.
+@pytest.mark.parametrize("chunk_size", [None, 64])
+@pytest.mark.parametrize("ep", ["cpu", "cuda"])
+def test_lfm3_vl_window_sized_kv_caches_match_full_caches(test_data_path, tmp_path, ep, chunk_size):
+    if ep == "cuda" and not og.is_cuda_available():
+        pytest.skip("needs the CUDA build of onnxruntime_genai")
+    builder_tests = _builder_tests()
+    import test_lfm3  # noqa: PLC0415
+
+    io_dtype = builder_tests.ir.DataType.FLOAT16 if ep == "cuda" else builder_tests.ir.DataType.FLOAT
+    sliding_layer = builder_tests.stand_in_config(tmp_path).text_config.layer_types.index("sliding_attention")
+
+    def generate(name, extra_options):
+        (tmp_path / name).mkdir()
+        output, config, _ = _build_stand_in_pipeline(test_data_path, tmp_path / name, ep, io_dtype, extra_options)
+        model = og.Model(os.fspath(output))
+        inputs = model.create_multimodal_processor()(_prompt(2), images=_images((64, 96), (64, 64)))
+        max_length = inputs["input_ids"].as_numpy().shape[1] + 24
+        params = og.GeneratorParams(model)
+        # No EOS before max_length, so the steps run through several evictions
+        params.set_search_options(
+            do_sample=False,
+            min_length=max_length,
+            max_length=max_length,
+            **({"chunk_size": chunk_size} if chunk_size else {}),
+        )
+        generator = og.Generator(model, params)
+        generator.set_inputs(inputs)
+        logits = []
+        while not generator.is_done():
+            logits.append(generator.get_logits())
+            generator.generate_next_token()
+        sliding_length = generator.get_input(f"past_key_values.{sliding_layer}.key").shape[2]
+        window = config.text_config.sliding_window
+        return generator.get_sequence(0).copy(), np.stack(logits), sliding_length, window, max_length
+
+    sequence, logits, sliding_length, window, max_length = generate("windowed", {})
+    expected_sequence, expected_logits, full_length, _, _ = generate("full", {"windowed_kv_cache": False})
+
+    assert sliding_length == window + test_lfm3.CACHE_SLACK[ep]
+    assert full_length == max_length
+    np.testing.assert_array_equal(sequence, expected_sequence)
+    np.testing.assert_allclose(logits, expected_logits, rtol=0, atol=test_lfm3.ATOL[ep])

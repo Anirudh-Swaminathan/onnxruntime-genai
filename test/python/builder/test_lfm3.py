@@ -636,7 +636,10 @@ def test_lfm3_cuda_graph_capture_needs_full_length_kv_caches(tmp_path):
         ("cuda", ir.DataType.FLOAT16, "Lfm3ForCausalLM", {"use_paged_attention": True}, False),
         ("webgpu", ir.DataType.FLOAT16, "Lfm3ForCausalLM", {}, False),
         ("trt-rtx", ir.DataType.FLOAT16, "Lfm3ForCausalLM", {}, False),
-        ("cpu", ir.DataType.FLOAT, "Lfm3VlForConditionalGeneration", {"exclude_embeds": True}, False),
+        # The decoder of the lfm3_vl pipeline
+        ("cpu", ir.DataType.FLOAT, "Lfm3VlForConditionalGeneration", {"exclude_embeds": True}, True),
+        ("cuda", ir.DataType.FLOAT16, "Lfm3VlForConditionalGeneration", {"exclude_embeds": True}, True),
+        ("webgpu", ir.DataType.FLOAT16, "Lfm3VlForConditionalGeneration", {"exclude_embeds": True}, False),
         ("cpu", ir.DataType.FLOAT, "Lfm3AudioForConditionalGeneration", {"exclude_embeds": True}, False),
         ("cpu", ir.DataType.FLOAT, "Lfm3OmniForConditionalGeneration", {"exclude_embeds": True}, False),
     ],
@@ -693,7 +696,7 @@ def test_lfm3_export_cut_before_its_first_sliding_layer_has_no_window(tmp_path):
         ("webgpu", ir.DataType.FLOAT16, "Lfm3ForCausalLM", {}),
         ("cuda", ir.DataType.FLOAT16, "Lfm3ForCausalLM", {"enable_cuda_graph": True}),
         ("cuda", ir.DataType.FLOAT16, "Lfm3ForCausalLM", {"use_paged_attention": True}),
-        ("cpu", ir.DataType.FLOAT, "Lfm3VlForConditionalGeneration", {"exclude_embeds": True}),
+        ("cpu", ir.DataType.FLOAT, "Lfm3AudioForConditionalGeneration", {"exclude_embeds": True}),
     ],
 )
 def test_lfm3_warns_when_it_ignores_windowed_kv_cache(capsys, ep, io_dtype, architecture, extra_options):
@@ -707,9 +710,18 @@ def test_lfm3_warns_when_it_ignores_windowed_kv_cache(capsys, ep, io_dtype, arch
     assert "ignores windowed_kv_cache" not in capsys.readouterr().out
 
 
-def test_lfm3_takes_windowed_kv_cache_where_it_has_run(capsys):
+@pytest.mark.parametrize(
+    "architecture,extra_options",
+    [("Lfm3ForCausalLM", {}), ("Lfm3VlForConditionalGeneration", {"exclude_embeds": True})],
+)
+def test_lfm3_takes_windowed_kv_cache_where_it_has_run(capsys, architecture, extra_options):
     model = LFM3Model(
-        _stand_in_config(), ir.DataType.FLOAT, ir.DataType.FLOAT, "cpu", None, {"windowed_kv_cache": True}
+        _stand_in_config(architecture),
+        ir.DataType.FLOAT,
+        ir.DataType.FLOAT,
+        "cpu",
+        None,
+        {**extra_options, "windowed_kv_cache": True},
     )
 
     assert model.uses_windowed_kv_cache()

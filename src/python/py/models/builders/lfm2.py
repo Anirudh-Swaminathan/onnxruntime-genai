@@ -356,15 +356,18 @@ class LFM3Model(LFM2Model):
             for name in ("audio_start_token_id", "mixed_start_token_id", "text_end_token_id")
             if getattr(config, name, None) is not None
         ]
-        # Window-sized KV caches run on text exports for CPU and CUDA. ConvKeyValueCache refuses them under graph
-        # capture, which reruns the step it captures and so evicts from the window more than once. Decided here because
-        # Model.__init__ calls make_context_length_init before it sets self.ep.
+        # Window-sized KV caches run on text and lfm3_vl exports for CPU and CUDA. ConvKeyValueCache refuses them under
+        # graph capture, which reruns the step it captures and so evicts from the window more than once. Decided here
+        # because Model.__init__ calls make_context_length_init before it sets self.ep.
         # TODO: turn them on for TRT-RTX once a windowed export runs there; for WebGPU once its GroupQueryAttention
         # takes sliding_window_cache=1, which also needs webgpu in Model.uses_windowed_kv_cache; for paged exports once
-        # the Engine's window ring has run with conv state; for exclude_embeds once the pipelines that read it exist.
-        self.keep_max_length_kv_caches = ep not in {"cpu", "cuda"} or any(
-            extra_options.get(option, False)
-            for option in ("use_paged_attention", "enable_cuda_graph", "exclude_embeds")
+        # the Engine's window ring has run with conv state; for the lfm3_audio and lfm3_omni decoders once their
+        # pipelines have run with them.
+        _, pipeline = self.MULTIMODAL.get(self.architecture, (None, None))
+        self.keep_max_length_kv_caches = (
+            ep not in {"cpu", "cuda"}
+            or any(extra_options.get(option, False) for option in ("use_paged_attention", "enable_cuda_graph"))
+            or (extra_options.get("exclude_embeds", False) and pipeline != "lfm3_vl")
         )
         super().__init__(config, io_dtype, onnx_dtype, ep, cache_dir, extra_options)
         # An export cut by num_hidden_layers before its first sliding layer has nothing to window.
@@ -399,8 +402,8 @@ class LFM3Model(LFM2Model):
         if self.keep_max_length_kv_caches:
             if self.extra_options.get("windowed_kv_cache", False):
                 print(
-                    "Warning: LFM3 ignores windowed_kv_cache=true here: only text exports for CPU and CUDA, without "
-                    "paged attention or graph capture, have window-sized KV caches."
+                    "Warning: LFM3 ignores windowed_kv_cache=true here: only text and lfm3_vl exports for CPU and "
+                    "CUDA, without paged attention or graph capture, have window-sized KV caches."
                 )
             self.context_length_attrs["window_kv_cache"] = False
 
